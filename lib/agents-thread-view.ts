@@ -1,57 +1,209 @@
-import { truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { Markdown, truncateToWidth, visibleWidth, wrapTextWithAnsi, type MarkdownTheme } from "@earendil-works/pi-tui";
 import { THREAD_ITEM, type ThreadItem, type ToolItem } from "./agents-protocol.ts";
+import {
+	CARD_TONE, cardBodyRows, cardBottom, cardInnerWidth, cardTop, floatRows, type CardTheme, type CardTone,
+} from "./shell-card.ts";
+import { sanitizeTerminalText } from "./terminal-theme.ts";
 
-export interface AgentsThreadTheme {
-	fg(color: string, text: string): string;
+/** The host theme, plus the text attributes Markdown needs when the theme offers them. */
+export interface AgentsThreadTheme extends CardTheme {
+	bold?(text: string): string;
+	italic?(text: string): string;
+	underline?(text: string): string;
+	strikethrough?(text: string): string;
 }
 
-const ROLE = {
+// Prose roles mirror the parent transcript: assistant text reads as text,
+// thinking is dim, a note is muted. Tool calls are cards instead, so they use
+// the same chrome as every other conversation card.
+const PROSE = {
 	TEXT: "text",
 	THINKING: "dim",
-	TOOL: "accent",
-	TOOL_ERROR: "error",
-	OUTPUT: "muted",
 	NOTE: "muted",
 	LABEL: "customMessageLabel",
 } as const;
 
-function line(theme: AgentsThreadTheme, role: string, text: string, width: number): string {
-	return theme.fg(role, truncateToWidth(text, Math.max(1, width), "…"));
+const OUTPUT_INDENT = 2;
+
+// Pi's own transcript paints Markdown with these theme tokens.
+const MD_TOKEN = {
+	heading: "mdHeading",
+	link: "mdLink",
+	linkUrl: "mdLinkUrl",
+	code: "mdCode",
+	codeBlock: "mdCodeBlock",
+	codeBlockBorder: "mdCodeBlockBorder",
+	quote: "mdQuote",
+	quoteBorder: "mdQuoteBorder",
+	hr: "mdHr",
+	listBullet: "mdListBullet",
+} as const;
+
+/** Paint with a role, keeping the content when the host theme lacks that token. */
+function paint(theme: AgentsThreadTheme, role: string): (text: string) => string {
+	return (text: string) => {
+		try {
+			return theme.fg(role, text);
+		} catch {
+			return text;
+		}
+	};
 }
 
-function contentLines(theme: AgentsThreadTheme, role: string, text: string, width: number, requestedIndent: number): string[] {
-	const indent = Math.min(requestedIndent, Math.max(0, width - 1));
-	const prefix = " ".repeat(indent);
-	const contentWidth = Math.max(1, width - indent);
-	return text.split("\n").flatMap((source) => {
-		if (source.length === 0) return [theme.fg(role, prefix)];
-		const wrapped = wrapTextWithAnsi(source, contentWidth);
-		return (wrapped.length > 0 ? wrapped : [source]).map((part) => theme.fg(role, `${prefix}${part}`));
+/**
+ * Markdown theme for one block. Prose uses Pi's transcript tokens; `mono` paints
+ * every token and attribute with a single role instead, which is what keeps a
+ * thinking block uniformly dim without losing its structure.
+ */
+function markdownTheme(theme: AgentsThreadTheme, mono?: string): MarkdownTheme {
+	const token = (name: string) => paint(theme, mono ?? name);
+	const attribute = (name: keyof Pick<AgentsThreadTheme, "bold" | "italic" | "underline" | "strikethrough">) => (text: string) => {
+		if (mono !== undefined) return token(mono)(text);
+		const apply = theme[name];
+		return apply ? apply.call(theme, text) : text;
+	};
+	return {
+		heading: token(MD_TOKEN.heading),
+		link: token(MD_TOKEN.link),
+		linkUrl: token(MD_TOKEN.linkUrl),
+		code: token(MD_TOKEN.code),
+		codeBlock: token(MD_TOKEN.codeBlock),
+		codeBlockBorder: token(MD_TOKEN.codeBlockBorder),
+		quote: token(MD_TOKEN.quote),
+		quoteBorder: token(MD_TOKEN.quoteBorder),
+		hr: token(MD_TOKEN.hr),
+		listBullet: token(MD_TOKEN.listBullet),
+		bold: attribute("bold"),
+		italic: attribute("italic"),
+		underline: attribute("underline"),
+		strikethrough: attribute("strikethrough"),
+	};
+}
+
+// Markdown pads every row to the render width; trailing blanks carry no content
+// and would only add noise to the thread cache.
+function markdownLines(theme: AgentsThreadTheme, text: string, width: number, role: string, mono = false): string[] {
+	const target = Math.max(1, Math.floor(width));
+	const rendered = new Markdown(text, 0, 0, markdownTheme(theme, mono ? role : undefined), { color: paint(theme, role) })
+		.render(target);
+	return rendered.map((row) => row.replace(/[ \t]+$/u, ""));
+}
+
+function singleLine(value: string): string {
+	return sanitizeTerminalText(value)
+		.replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, "")
+		.replace(/\s+/gu, " ")
+		.trim();
+}
+
+// The one argument that identifies a call, in the order a reader needs it.
+const SUMMARY_KEYS = [
+	"command", "cmd", "path", "file_path", "filePath", "file", "pattern", "query", "queries",
+	"url", "prompt", "description", "label", "subject", "name", "sessionId",
+] as const;
+
+/** The call's identifying argument as one sanitized line, never JSON. */
+function argSummary(args: Record<string, unknown>): string {
+	const text = (value: unknown): string => {
+		if (typeof value === "string") return singleLine(value);
+		if (typeof value === "number" && Number.isFinite(value)) return String(value);
+		if (Array.isArray(value)) {
+			const first = value.find((entry) => typeof entry === "string") as string | undefined;
+			return first === undefined ? "" : singleLine(first);
+		}
+		return "";
+	};
+	for (const key of SUMMARY_KEYS) {
+		const shown = text(args[key]);
+		if (shown.length > 0) return shown;
+	}
+	for (const value of Object.values(args)) {
+		const shown = text(value);
+		if (shown.length > 0) return shown;
+	}
+	return "";
+}
+
+interface ToolState {
+	tone: CardTone;
+	glyph: string;
+	status: string;
+}
+
+// The same state glyphs the Agents card uses, so a running call reads the same
+// way in the card above the editor and inside the thread.
+function toolState(item: ToolItem): ToolState {
+	if (item.isError) return { tone: CARD_TONE.ERROR, glyph: "✗", status: "Error" };
+	if (item.running) return { tone: CARD_TONE.INFO, glyph: "◐", status: "Running" };
+	return { tone: CARD_TONE.INFO, glyph: "✓", status: "Complete" };
+}
+
+/** Every retained output line, indented and wrapped so nothing is clipped. */
+function outputRows(item: ToolItem, cardWidth: number): string[] {
+	if (item.output.length === 0) return [];
+	const width = Math.max(1, cardInnerWidth(cardWidth) - OUTPUT_INDENT);
+	const prefix = " ".repeat(OUTPUT_INDENT);
+	return item.output.split("\n").flatMap((source) => {
+		if (source.length === 0) return [""];
+		const wrapped = wrapTextWithAnsi(source, width);
+		return (wrapped.length > 0 ? wrapped : [source]).map((row) => `${prefix}${row}`);
 	});
 }
 
-function toolStatus(item: ToolItem): "Running" | "Error" | "Complete" {
-	if (item.isError) return "Error";
-	return item.running ? "Running" : "Complete";
+function toolLines(item: ToolItem, theme: AgentsThreadTheme, width: number): string[] {
+	const state = toolState(item);
+	return floatRows(state.tone, theme, width, (cardWidth) => {
+		const title = singleLine(item.name) || "tool";
+		const summary = argSummary(item.args);
+		const room = Math.max(8, cardWidth - visibleWidth(title) - 16);
+		const subtitle = summary.length === 0 ? undefined : truncateToWidth(summary, room, "…");
+		const body = outputRows(item, cardWidth);
+		return {
+			head: [cardTop({ title, subtitle, body: [], tone: state.tone, glyph: state.glyph }, theme, cardWidth)],
+			...(body.length > 0 ? { body: cardBodyRows(body, state.tone, theme, cardWidth, { expanded: true }) } : {}),
+			bottom: cardBottom(state.tone, theme, cardWidth, state.status),
+		};
+	});
 }
 
-/** Render already-sanitized, bounded protocol items without inferring content roles. */
+function thinkingLines(text: string, theme: AgentsThreadTheme, width: number): string[] {
+	const indent = " ".repeat(OUTPUT_INDENT);
+	const body = markdownLines(theme, text, width - OUTPUT_INDENT, PROSE.THINKING, true)
+		.map((row) => `${indent}${row}`.replace(/[ \t]+$/u, ""));
+	return [paint(theme, PROSE.LABEL)("Thinking"), ...body];
+}
+
+function noteLines(text: string, theme: AgentsThreadTheme, width: number): string[] {
+	const rows = text.split("\n");
+	return floatRows(CARD_TONE.INFO, theme, width, (cardWidth) => ({
+		head: [cardTop({ title: "Note", body: [], tone: CARD_TONE.INFO, glyph: "↳" }, theme, cardWidth)],
+		body: cardBodyRows(rows.map((row) => (row === "" ? "" : paint(theme, PROSE.NOTE)(row))), CARD_TONE.INFO, theme, cardWidth,
+			{ expanded: true }),
+		bottom: cardBottom(CARD_TONE.INFO, theme, cardWidth),
+	}));
+}
+
+/**
+ * Render already-sanitized, bounded protocol items. Prose keeps the parent
+ * transcript's Markdown, and a tool call becomes a conversation card with the
+ * call's identifying argument and every retained output line. Every item ends
+ * with one blank row, so mixed prose and cards keep a single separator.
+ */
 export function renderThreadItem(item: ThreadItem, theme: AgentsThreadTheme, width: number): string[] {
 	if (width <= 0) return [];
-	switch (item.kind) {
-		case THREAD_ITEM.TEXT:
-			return [line(theme, ROLE.LABEL, "Text", width), ...contentLines(theme, ROLE.TEXT, item.text, width, 2)];
-		case THREAD_ITEM.THINKING:
-			return [line(theme, ROLE.LABEL, "Thinking", width), ...contentLines(theme, ROLE.THINKING, item.text, width, 2)];
-		case THREAD_ITEM.NOTE:
-			return [line(theme, ROLE.NOTE, "Note", width), ...contentLines(theme, ROLE.NOTE, item.text, width, 2)];
-		case THREAD_ITEM.TOOL: {
-			const role = item.isError ? ROLE.TOOL_ERROR : ROLE.TOOL;
-			const header = line(theme, role, `Tool · ${item.name} · ${toolStatus(item)}`, width);
-			if (item.output.length === 0) return [header];
-			return [header, line(theme, ROLE.OUTPUT, "  Output", width), ...contentLines(theme, ROLE.OUTPUT, item.output, width, 4)];
+	const rows = ((): string[] => {
+		switch (item.kind) {
+			case THREAD_ITEM.TEXT:
+				return markdownLines(theme, item.text, width, PROSE.TEXT);
+			case THREAD_ITEM.THINKING:
+				return thinkingLines(item.text, theme, width);
+			case THREAD_ITEM.NOTE:
+				return noteLines(item.text, theme, width);
+			case THREAD_ITEM.TOOL:
+				return toolLines(item, theme, width);
+			default:
+				return [];
 		}
-		default:
-			return [];
-	}
+	})();
+	return rows.length === 0 ? rows : [...rows, ""];
 }

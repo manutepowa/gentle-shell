@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { emptyThread, TASK_EVENT, TASK_STATUS, TaskStore, type TaskRecord } from "../lib/agents-protocol.ts";
-import { renderThreadItem } from "../lib/agents-thread-view.ts";
 import { AgentsView, taskHeader } from "../lib/agents-view.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 
@@ -195,7 +194,7 @@ test("fullscreen retains every semantic block and hides Stop for unowned active 
 		for (const line of frame.slice(1, 6)) seen.add(line);
 		view.handleMouse(mouse(4, 2, 60, 8, "wheel", 1));
 	}
-	assert.match([...seen].join("\n"), /Thinking[\s\S]*reasoning retained[\s\S]*Text[\s\S]*answer retained[\s\S]*Tool[\s\S]*output 39[\s\S]*Note[\s\S]*final retained note/);
+	assert.match([...seen].join("\n"), /Thinking[\s\S]*reasoning retained[\s\S]*answer retained[\s\S]*output 39[\s\S]*final retained note/);
 	view.handleInput("s");
 	assert.deepEqual(events, []);
 	assert.deepEqual(store.thread("a"), thread, "presentation does not mutate retention");
@@ -228,20 +227,20 @@ test("presentation changes invalidate pointer geometry before another frame", ()
 	view.dispose();
 });
 
-test("renderThreadItem renders labeled text, thinking, tool-output, and note blocks", () => {
-	assert.deepEqual(renderThreadItem({ kind: "text", text: "one two three four" }, plainTheme, 9), ["Text", "  one two", "  three", "  four"]);
-	assert.deepEqual(renderThreadItem({ kind: "thinking", text: "deep\nthoughts" }, plainTheme, 20), ["Thinking", "  deep", "  thoughts"]);
-	const output = Array.from({ length: 10 }, (_, index) => `line ${index}`).join("\n");
-	const tool = renderThreadItem({ kind: "tool", callId: "c", name: "bash", args: { command: "ls  -la" }, output, running: true, isError: false }, plainTheme, 30);
-	assert.equal(tool[0], "Tool · bash · Running");
-	assert.equal(tool.length, 12, "head, output label, and every retained output line");
-	assert.equal(tool[1], "  Output");
-	assert.equal(tool[2], "    line 0");
-	assert.equal(tool[11], "    line 9");
-	// A long output line wraps instead of being clipped, so nothing is hidden.
-	const wide = renderThreadItem({ kind: "tool", callId: "c", name: "bash", args: {}, output: "alpha beta gamma delta", running: false, isError: false }, plainTheme, 12);
-	assert.deepEqual(wide.slice(2), ["    alpha", "    beta", "    gamma", "    delta"]);
-	assert.deepEqual(renderThreadItem({ kind: "note", text: "error: boom" }, plainTheme, 30), ["Note", "  error: boom"]);
+test("the thread pane renders prose as Markdown and a tool call as a card", () => {
+	const { store, view } = harness(20);
+	store.restore(task("a"), { ...emptyThread(), items: [
+		{ kind: "text", text: "## Answer\n\nbody text" },
+		{ kind: "tool", callId: "c", name: "bash", args: { command: "ls  -la" }, output: "one\ntwo", running: true, isError: false },
+		{ kind: "note", text: "keep this" },
+	] });
+	view.render(80);
+	const frame = view.render(80).map(stripAnsi).join("\n");
+	assert.match(frame, /│ Answer +│/, "a heading renders as prose, not as a labeled block");
+	assert.doesNotMatch(frame, /\bText\b/, "prose is no longer announced by a block label");
+	assert.match(frame, /◐ bash · ls -la/, "the card header carries the call's identifying argument on one line");
+	assert.match(frame, /Running/, "the card closes with the call's state");
+	assert.match(frame, /↳ Note/, "a note keeps its own card");
 	assert.equal(taskHeader(task("a"), 61_000), "explore · running · gpt-5.6-terra · 34k · $0.270 · 1m00s");
 });
 
@@ -285,15 +284,14 @@ test("AgentsView keys move the selection, scroll, follow, cancel, open, and clos
 	assert.deepEqual(events, ["cancel:a", "open:a"]);
 	for (let index = 0; index < 12; index += 1) store.apply("a", { type: TASK_EVENT.TEXT, text: `l${index}\n` }, 2000);
 	view.handleInput("\x1b[5~");
-	assert.match(stripAnsi(view.render(80)[2]), /│ Text +│$/, "page up leaves follow mode and shows the top block label");
-	assert.match(stripAnsi(view.render(80)[3]), /│   l0 +│$/, "page up leaves follow mode and shows the top block body");
+	assert.match(stripAnsi(view.render(80)[2]), /l0 +│$/, "page up leaves follow mode and shows the top of the thread");
+	assert.doesNotMatch(stripAnsi(view.render(80).join("\n")), /l9 +│/, "page up stops showing the tail");
 	view.handleInput("\x0a");
-	assert.match(stripAnsi(view.render(80)[2]), /│   l3 +│$/, "ctrl+j scrolls one page down across the labeled block");
+	assert.match(stripAnsi(view.render(80)[2]), /l4 +│$/, "ctrl+j scrolls one page down");
 	view.handleInput("\x0b");
-	assert.match(stripAnsi(view.render(80)[2]), /│ Text +│$/, "ctrl+k scrolls one page up to the labeled block");
-	assert.match(stripAnsi(view.render(80)[3]), /│   l0 +│$/, "ctrl+k restores the top block body");
+	assert.match(stripAnsi(view.render(80)[2]), /l0 +│$/, "ctrl+k scrolls one page back up");
 	view.handleInput("f");
-	assert.match(stripAnsi(view.render(80)[2]), /│   l9 +│$/, "f follows the tail again");
+	assert.match(stripAnsi(view.render(80)[2]), /l9 +│$/, "f follows the tail again");
 	view.handleInput("\x1b");
 	assert.deepEqual(events, ["cancel:a", "open:a", "close"]);
 });
@@ -690,12 +688,12 @@ test("AgentsView rejects cached-height pointer input before the live resize rend
 	for (let index = 0; index < 12; index += 1) store.apply("a", { type: TASK_EVENT.TEXT, text: `l${index}\n` }, 2000);
 	view.handleInput("\x1b[5~");
 	const oldFrame = view.render(80);
-	assert.match(stripAnsi(oldFrame[3] ?? ""), /l0/, "manual scrolling establishes a stable pre-resize position");
+	assert.match(stripAnsi(oldFrame[2] ?? ""), /l0/, "manual scrolling establishes a stable pre-resize position");
 	rows = 6;
 	assert.equal(view.handleMouse(mouse(50, 2, 80, oldFrame.length, "wheel", 1)), undefined, "old-height wheel input is inert before the resize frame");
 	const resized = view.render(80);
-	assert.match(stripAnsi(resized[3] ?? ""), /l0/, "the stale wheel leaves manual thread scroll unchanged");
+	assert.match(stripAnsi(resized[2] ?? ""), /l0/, "the stale wheel leaves manual thread scroll unchanged");
 	assert.equal(view.handleMouse(mouse(50, 2, 80, resized.length, "wheel", 1))?.handled, true, "the new-height wheel reaches the rendered thread region");
-	assert.match(stripAnsi(view.render(80)[2] ?? ""), /l0/, "the live wheel scrolls past the semantic block label after the new frame");
+	assert.match(stripAnsi(view.render(80)[2] ?? ""), /l1/, "the live wheel scrolls the thread after the new frame");
 	view.dispose();
 });
