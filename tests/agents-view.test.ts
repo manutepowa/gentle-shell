@@ -821,3 +821,18 @@ test("the thread header carries the model with its effort and never repeats the 
 	assert.equal(taskHeader(task("a"), 61_000), "running · gpt-5.6-terra · 34k · $0.270 · 1m00s", "a task without a recorded effort omits it");
 	assert.doesNotMatch(taskHeader(task("a", { thinking: "high" }), 61_000), /explore/, "the list row already names the agent, so the header does not repeat it");
 });
+
+test("a manual scroll clamps on the band's own geometry, so one page up always moves", () => {
+	const { store, view } = harness(12);
+	store.add(task("a"));
+	for (let index = 0; index < 40; index += 1) store.apply("a", { type: TASK_EVENT.TEXT, text: `line ${index}\n` }, 2000);
+	const rows = () => threadBands(view.render(100));
+	rows();
+	view.handleInput("\x1b[6~");
+	view.handleInput("\x1b[6~");
+	assert.equal(rows().filter(Boolean).at(-1), "line 39", "paging past the end settles on the last line");
+	const bottom = rows();
+	view.handleInput("\x1b[5~");
+	assert.notDeepEqual(rows(), bottom, "one page up moves instead of re-clamping to the same window");
+	view.dispose();
+});

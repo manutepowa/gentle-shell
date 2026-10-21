@@ -863,8 +863,15 @@ export class AgentsView {
 	}
 
 	private scrollBy(delta: number): void {
+		const task = this.selectedTask();
+		const layout = this.layout();
+		// The thread's own geometry: same content width and header rows the renderer uses,
+		// so a manual scroll clamps exactly where the window ends.
+		const lines = task ? this.threadLines(this.remoteThreads.get(task.id) ?? this.deps.store.thread(task.id), this.threadContentWidth(layout)) : [];
+		const maxScroll = Math.max(0, lines.length - Math.max(0, layout.bodyRows - THREAD_HEADER_ROWS));
 		this.follow = false;
-		this.scroll = Math.max(0, this.scroll + delta);
+		// Clamp the current visible position before moving, including after resize.
+		this.scroll = Math.max(0, Math.min(maxScroll, Math.min(this.scroll, maxScroll) + delta));
 		this.deps.requestRender();
 	}
 
