@@ -14,7 +14,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { join, resolve, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createLocalBashOperations, keyHint, SettingsManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { createLocalBashOperations, keyHint, keyText, SettingsManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createJobRegistry, isStandaloneSleep, type JobExecOperations, type JobRecord } from "../lib/background-jobs.ts";
 import { JOB_GLYPH, JOB_NOTICE_TYPE, jobDetails, jobNoticeText, monitorEventsText, monitorStoppedText, registerBackgroundJobTools } from "../lib/background-jobs-tools.ts";
 import { createMonitorController, mergeMonitorBatches, type MonitorNotice } from "../lib/background-monitor.ts";
@@ -1518,7 +1518,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		let view: AgentsView | undefined;
 		let overlayHost: { requestRender(force?: boolean): void; stop(): void; start(): void } | undefined;
 		const chosen = await ctx.ui.custom<TaskRecord | null>(
-			(tui, theme, _keybindings, done) => {
+			(tui, theme, keybindings, done) => {
 				const close = withOverlayRepaint(tui, done);
 				overlayHost = tui;
 				view = new AgentsView({
@@ -1534,6 +1534,14 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 					onCancel: (task) => void stopSelected(task, ctx),
 					canCancel: isOwnedActive,
 					isLocalTask: (task) => !restoredTaskIds.has(task.id),
+					// The thread folds tool output exactly like the parent transcript, under the host's own binding.
+					// A host that cannot resolve the action keeps the default key instead of losing the toggle.
+					toolOutputToggle: typeof keybindings?.matches === "function"
+						? {
+							matches: (data: string) => keybindings.matches(data, "app.tools.expand"),
+							keyText: () => keyText("app.tools.expand"),
+						}
+						: undefined,
 					onOpen: (task) => close(task),
 					onClose: () => close(null),
 					requestRender: () => tui.requestRender(),

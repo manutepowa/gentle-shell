@@ -44,7 +44,7 @@ test("AgentsView integrates flat current-session selection, semantic scrolling, 
 	view.handleInput("k");
 	view.handleInput("\x1b[D");
 	assert.equal(view.selectedTask()?.id, "first", "up and left keep the first task selected without a group heading");
-	rows = 6;
+	rows = 7;
 	assert.equal(view.handleMouse(mouse(closeX, 0, wide, frame.length)), undefined, "old close bounds are inert before the live resize frame");
 	frame = view.render(wide);
 	assert.equal(frame.length, rows, "the next frame uses the live height budget");

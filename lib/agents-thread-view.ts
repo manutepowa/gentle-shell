@@ -1,5 +1,5 @@
 import { Markdown, truncateToWidth, visibleWidth, wrapTextWithAnsi, type MarkdownTheme } from "@earendil-works/pi-tui";
-import { THREAD_ITEM, type ThreadItem, type ToolItem } from "./agents-protocol.ts";
+import { NOTE_SEVERITY, THREAD_ITEM, type NoteSeverity, type ThreadItem, type ToolItem } from "./agents-protocol.ts";
 import {
 	CARD_TONE, cardBodyRows, cardBottom, cardInnerWidth, cardTop, floatRows, type CardTheme, type CardTone,
 } from "./shell-card.ts";
@@ -138,6 +138,14 @@ function toolState(item: ToolItem): ToolState {
 	return { tone: CARD_TONE.INFO, glyph: "✓", status: "Complete" };
 }
 
+/** How one thread item is drawn: the host's fold state and the hint that names its binding. */
+export interface ThreadRenderOptions {
+	/** Show every retained output row instead of the three-row preview. */
+	expanded?: boolean;
+	/** Border hint naming the host binding; omitted when the host disabled the action. */
+	hint?: string;
+}
+
 /** Every retained output line, indented and wrapped so nothing is clipped. */
 function outputRows(item: ToolItem, cardWidth: number): string[] {
 	if (item.output.length === 0) return [];
@@ -150,8 +158,10 @@ function outputRows(item: ToolItem, cardWidth: number): string[] {
 	});
 }
 
-function toolLines(item: ToolItem, theme: AgentsThreadTheme, width: number): string[] {
+function toolLines(item: ToolItem, theme: AgentsThreadTheme, width: number, options: ThreadRenderOptions): string[] {
 	const state = toolState(item);
+	// A call with nothing to show has nothing to fold, so it never advertises the toggle.
+	const hint = item.output.length === 0 ? undefined : options.hint;
 	return floatRows(state.tone, theme, width, (cardWidth) => {
 		const title = singleLine(item.name) || "tool";
 		const summary = argSummary(item.args);
@@ -159,8 +169,8 @@ function toolLines(item: ToolItem, theme: AgentsThreadTheme, width: number): str
 		const subtitle = summary.length === 0 ? undefined : truncateToWidth(summary, room, "…");
 		const body = outputRows(item, cardWidth);
 		return {
-			head: [cardTop({ title, subtitle, body: [], tone: state.tone, glyph: state.glyph }, theme, cardWidth)],
-			...(body.length > 0 ? { body: cardBodyRows(body, state.tone, theme, cardWidth, { expanded: true }) } : {}),
+			head: [cardTop({ title, subtitle, body: [], tone: state.tone, glyph: state.glyph }, theme, cardWidth, hint)],
+			...(body.length > 0 ? { body: cardBodyRows(body, state.tone, theme, cardWidth, { expanded: options.expanded === true, previewRows: 3 }) } : {}),
 			bottom: cardBottom(state.tone, theme, cardWidth, state.status),
 		};
 	});
@@ -173,13 +183,17 @@ function thinkingLines(text: string, theme: AgentsThreadTheme, width: number): s
 	return [paint(theme, PROSE.LABEL)("Thinking"), ...body];
 }
 
-function noteLines(text: string, theme: AgentsThreadTheme, width: number): string[] {
+// A note is a notice, unless the child reported a failure: then it wears the
+// error card, so a reader scanning the thread never mistakes it for chatter.
+function noteLines(text: string, theme: AgentsThreadTheme, width: number, severity?: NoteSeverity): string[] {
+	const failed = severity === NOTE_SEVERITY.ERROR;
+	const tone = failed ? CARD_TONE.ERROR : CARD_TONE.INFO;
 	const rows = text.split("\n");
-	return floatRows(CARD_TONE.INFO, theme, width, (cardWidth) => ({
-		head: [cardTop({ title: "Note", body: [], tone: CARD_TONE.INFO, glyph: "↳" }, theme, cardWidth)],
-		body: cardBodyRows(rows.map((row) => (row === "" ? "" : paint(theme, PROSE.NOTE)(row))), CARD_TONE.INFO, theme, cardWidth,
+	return floatRows(tone, theme, width, (cardWidth) => ({
+		head: [cardTop({ title: failed ? "Error" : "Note", body: [], tone, glyph: failed ? "✗" : "↳" }, theme, cardWidth)],
+		body: cardBodyRows(rows.map((row) => (row === "" ? "" : paint(theme, failed ? CARD_TONE.ERROR : PROSE.NOTE)(row))), tone, theme, cardWidth,
 			{ expanded: true }),
-		bottom: cardBottom(CARD_TONE.INFO, theme, cardWidth),
+		bottom: cardBottom(tone, theme, cardWidth),
 	}));
 }
 
@@ -189,7 +203,7 @@ function noteLines(text: string, theme: AgentsThreadTheme, width: number): strin
  * call's identifying argument and every retained output line. Every item ends
  * with one blank row, so mixed prose and cards keep a single separator.
  */
-export function renderThreadItem(item: ThreadItem, theme: AgentsThreadTheme, width: number): string[] {
+export function renderThreadItem(item: ThreadItem, theme: AgentsThreadTheme, width: number, options: ThreadRenderOptions = {}): string[] {
 	if (width <= 0) return [];
 	const rows = ((): string[] => {
 		switch (item.kind) {
@@ -198,9 +212,9 @@ export function renderThreadItem(item: ThreadItem, theme: AgentsThreadTheme, wid
 			case THREAD_ITEM.THINKING:
 				return thinkingLines(item.text, theme, width);
 			case THREAD_ITEM.NOTE:
-				return noteLines(item.text, theme, width);
+				return noteLines(item.text, theme, width, item.severity);
 			case THREAD_ITEM.TOOL:
-				return toolLines(item, theme, width);
+				return toolLines(item, theme, width, options);
 			default:
 				return [];
 		}

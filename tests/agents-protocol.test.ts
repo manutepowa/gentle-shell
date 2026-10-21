@@ -293,3 +293,14 @@ test("TaskStore.apply moves the task to waiting on ask, back to running on any l
 	assert.equal(store.get("a")?.result, "final answer");
 	assert.equal(store.get("a")?.status, TASK_STATUS.RUNNING, "agent_end alone does not finish: the runner decides");
 });
+
+test("a child error becomes an error note, and an extension error keeps that severity", () => {
+	let thread = applyTaskEvent(emptyThread(), { type: TASK_EVENT.ERROR, message: "boom" });
+	assert.deepEqual(thread.items, [{ kind: THREAD_ITEM.NOTE, text: "error: boom", severity: "error" }]);
+	const normalized = normalizeRpcEvent({ type: "extension_error", error: "kaput" });
+	assert.deepEqual(normalized, [{ type: TASK_EVENT.NOTE, text: "extension error: kaput", severity: "error" }]);
+	thread = applyTaskEvent(emptyThread(), normalized[0]!);
+	assert.deepEqual(thread.items, [{ kind: THREAD_ITEM.NOTE, text: "extension error: kaput", severity: "error" }]);
+	const retry = applyTaskEvent(emptyThread(), normalizeRpcEvent({ type: "auto_retry_start", attempt: 1, maxAttempts: 3 })[0]!);
+	assert.deepEqual(retry.items, [{ kind: THREAD_ITEM.NOTE, text: "retrying (1/3)" }], "an informational note carries no severity key");
+});

@@ -3547,8 +3547,8 @@ test("the agents task card shows the winning layer next to the model, and render
 		thinking: undefined, sessionPath: null, error: null, result: null, lastStep: "", lastActivityAt: 60_000,
 		turns: 0, toolCalls: 0, tokens: 0, cost: 0,
 	} as TaskRecord;
-	assert.equal(taskHeader({ ...record, modelSource: "binding" }, 61_000), "explore · running · nan/glm5.3 · binding · 1s");
-	assert.equal(taskHeader(record, 61_000), "explore · running · nan/glm5.3 · 1s", "absent modelSource renders exactly as today");
+	assert.equal(taskHeader({ ...record, modelSource: "binding" }, 61_000), "running · nan/glm5.3 · binding · 1s");
+	assert.equal(taskHeader(record, 61_000), "running · nan/glm5.3 · 1s", "absent modelSource renders exactly as today");
 });
 
 test("agentsEnabled and agentsCollapseKey read their flags and stay off inside a child", () => {

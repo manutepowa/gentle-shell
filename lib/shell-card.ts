@@ -264,7 +264,8 @@ export interface CardParts {
 
 const FLOAT_MARGIN = 1;
 const FLOAT_MIN_WIDTH = 10;
-const FLOAT_BG_ROLE: Record<CardTone, string> = {
+/** The card's own background per tone; the thread header band reuses the info one. */
+export const FLOAT_BG_ROLE: Record<CardTone, string> = {
 	[CARD_TONE.INFO]: "toolSuccessBg",
 	[CARD_TONE.SUCCESS]: "toolSuccessBg",
 	[CARD_TONE.WARNING]: "toolPendingBg",

@@ -3,6 +3,7 @@ import { measureAgentsViewLayout, type AgentsViewLayout } from "./agents-view-la
 import { HOVER_ROLE, paintHoverable } from "./shell-hover.ts";
 import { emptyThread, isFinished, TASK_STATUS, type TaskRecord, type TaskStore, type TaskThread, type ThreadItem } from "./agents-protocol.ts";
 import { renderThreadItem, type AgentsThreadTheme } from "./agents-thread-view.ts";
+import { CARD_TONE, FLOAT_BG_ROLE } from "./shell-card.ts";
 import { formatElapsed } from "./agents-widget.ts";
 import { createNativePointerScope, type NativePointerRegion } from "./native-pointer-region.ts";
 import { formatCost, formatTokens } from "./shell-bar.ts";
@@ -24,6 +25,13 @@ export const VIEW_SCOPE = {
 
 export type ViewScope = (typeof VIEW_SCOPE)[keyof typeof VIEW_SCOPE];
 
+/** The host's `app.tools.expand` action: the same toggle the parent transcript uses. */
+export interface ToolOutputToggle {
+	matches(data: string): boolean;
+	/** The binding as the host displays it, empty when the host disabled the action. */
+	keyText(): string;
+}
+
 export interface AgentsViewDeps {
 	theme: AgentsViewTheme;
 	rows: number | (() => number);
@@ -34,6 +42,8 @@ export interface AgentsViewDeps {
 	onCancel(task: TaskRecord): void;
 	canCancel?(task: TaskRecord): boolean;
 	isLocalTask?(task: TaskRecord): boolean;
+	/** Absent outside a Pi TUI, which keeps the default binding without a host to resolve it. */
+	toolOutputToggle?: ToolOutputToggle;
 	onOpen(task: TaskRecord): void;
 	onClose(): void;
 	requestRender(): void;
@@ -75,6 +85,8 @@ const SCOPE_LABEL: Record<ViewScope, string> = { [VIEW_SCOPE.SESSION]: "this ses
 const SCOPE_KEY: Record<ViewScope, string> = { [VIEW_SCOPE.SESSION]: "all sessions", [VIEW_SCOPE.ALL]: "this session" };
 const EMPTY_LIST = "no tasks yet";
 const EMPTY_THREAD = "waiting for the first event";
+// Two banded rows above the thread: the stable fields, then the current step.
+const THREAD_HEADER_ROWS = 2;
 const FOLLOW_BUTTON = "[ Follow ]";
 const OPEN_BUTTON = "[ Open session ]";
 const CLOSE_BUTTON = "[× Close]";
@@ -143,10 +155,17 @@ function sameItemValue(a: unknown, b: unknown): boolean {
 }
 
 export function taskHeader(task: TaskRecord, now: number): string {
-	// #2180: the winning profile layer is shown right after the model it supplied;
-	// records without one render exactly as before.
-	const parts = [task.agent, task.status, task.model, ...(task.modelSource === undefined ? [] : [task.modelSource]), task.tokens > 0 ? formatTokens(task.tokens) : "", task.cost > 0 ? formatCost(task.cost) : "", task.startedAt === null ? "" : formatElapsed((task.endedAt ?? now) - task.startedAt)];
+	// The task row already names the agent, so the header carries the run itself:
+	// the model with the effort it was launched at, the profile layer that supplied
+	// it (#2180), and the counters.
+	const parts = [task.status, task.model, task.thinking ?? "", ...(task.modelSource === undefined ? [] : [task.modelSource]), task.tokens > 0 ? formatTokens(task.tokens) : "", task.cost > 0 ? formatCost(task.cost) : "", task.startedAt === null ? "" : formatElapsed((task.endedAt ?? now) - task.startedAt)];
 	return parts.filter((part) => part.length > 0).join(" · ");
+}
+
+/** What the task is doing right now, on its own row so the stable fields never move. */
+export function taskStep(task: TaskRecord): string {
+	const step = (task.lastStep ?? "").trim();
+	return step === task.status.trim() ? "" : step;
 }
 
 export class AgentsView {
@@ -166,6 +185,8 @@ export class AgentsView {
 	private scope: ViewScope;
 	private scroll = 0;
 	private follow = true;
+	// Tool calls start folded, exactly like the parent transcript's tool output.
+	private toolOutputExpanded = false;
 	private readonly pointerScope = createNativePointerScope();
 	private readonly taskRegions = new Map<number, NativePointerRegion>();
 	private readonly listRegion: NativePointerRegion;
@@ -329,6 +350,7 @@ export class AgentsView {
 		if (this.closed) return;
 		if (data === "q") return this.close();
 		if (matchesKey(data, Key.escape)) return this.back();
+		if (this.matchesToolOutputToggle(data)) return this.toggleToolOutput();
 		if (data === "F" && !this.isNarrow()) {
 			this.setNarrowView(this.narrowView === "list" ? "details" : "list");
 			return;
@@ -435,11 +457,19 @@ export class AgentsView {
 		const mode = modeLabel ? ` ${theme.fg(this.hoveredControl === "mode" ? "warning" : ROLE.KEY, modeLabel)}` : "";
 		const close = closeLabel ? ` ${theme.fg(this.hoveredControl === "close" ? "warning" : ROLE.KEY, closeLabel)}` : "";
 		const top = theme.fg(ROLE.FRAME, "╭─ ") + theme.fg(ROLE.TITLE, title) + theme.fg(ROLE.FRAME, ` ${rule(inner - visibleWidth(title) - 3 - controlsWidth)}`) + mode + close + theme.fg(ROLE.FRAME, "╮");
-		const detail = layout.mode === "panes" || this.narrowView === "details" ? this.threadWindow(layout.bodyRows, layout.threadWidth) : [];
+		// The thread owns the frame's side padding, so its band and its content reach the
+		// divider instead of leaving an unpainted cell: one extra cell in the split view,
+		// two in narrow details, where the pane is the whole inner width.
+		const contentWidth = this.threadContentWidth(layout);
+		const detail = layout.mode === "panes" || this.narrowView === "details" ? this.threadWindow(layout.bodyRows, contentWidth) : [];
 		const body: string[] = [];
 		for (let row = 0; row < layout.bodyRows; row += 1) {
-			if (layout.mode === "panes") body.push(`${theme.fg(ROLE.FRAME, "│")} ${fit(this.taskLine(row), layout.listWidth)} ${theme.fg(ROLE.FRAME, "│")} ${fit(detail[row] ?? "", layout.threadWidth)}${theme.fg(ROLE.FRAME, "│")}`);
-			else body.push(`${theme.fg(ROLE.FRAME, "│")} ${fit(this.narrowView === "list" ? this.taskLine(row) : detail[row] ?? "", layout.listWidth)} ${theme.fg(ROLE.FRAME, "│")}`);
+			if (layout.mode === "panes") {
+				body.push(`${theme.fg(ROLE.FRAME, "│")} ${fit(this.taskLine(row), layout.listWidth)} ${theme.fg(ROLE.FRAME, "│")}${fit(detail[row] ?? "", contentWidth)}${theme.fg(ROLE.FRAME, "│")}`);
+			} else {
+				const content = this.narrowView === "list" ? this.taskLine(row) : detail[row] ?? "";
+				body.push(`${theme.fg(ROLE.FRAME, "│")}${fit(content, contentWidth)}${theme.fg(ROLE.FRAME, "│")}`);
+			}
 		}
 		const keyHints = this.selectedRow()?.kind === "heading" ? [["←/→", "group"] as const, ...this.keys(layout.mode === "narrow")] : this.keys(layout.mode === "narrow");
 		const keys = keyHints.map(([key, label]) => `${theme.fg(ROLE.KEY, key)} ${theme.fg(ROLE.KEY_TEXT, label)}`).join("   ");
@@ -724,10 +754,11 @@ export class AgentsView {
 		}
 		const lines: string[] = [];
 		if (thread.dropped > 0) lines.push(this.deps.theme.fg(ROLE.META, `… ${thread.dropped} earlier items not kept`));
+		const hint = this.toolOutputHint();
 		for (const item of thread.items) {
 			let rendered = this.cache.get(item);
 			if (!rendered) {
-				rendered = renderThreadItem(item, this.deps.theme, width);
+				rendered = renderThreadItem(item, this.deps.theme, width, { expanded: this.toolOutputExpanded, hint });
 				this.cache.set(item, rendered);
 			}
 			lines.push(...rendered);
@@ -735,19 +766,54 @@ export class AgentsView {
 		return lines;
 	}
 
+	/** `width` is the whole thread column, frame padding included: the band and the content both use it. */
+	/** The thread's own width: the whole column between two dividers, padding included. */
+	private threadContentWidth(layout: AgentsViewLayout): number {
+		return layout.mode === "panes" ? layout.threadWidth + 1 : layout.listWidth + 2;
+	}
+
+	/** `width` is the whole thread column, frame padding included: the band and the content both use it. */
 	private threadWindow(rows: number, width: number): string[] {
 		const task = this.selectedTask();
 		if (!task) return [this.deps.theme.fg(ROLE.EMPTY, "Select a task to inspect its thread")];
 		const theme = this.deps.theme;
-		const header = theme.fg(ROLE.META, truncateToWidth(taskHeader(task, this.deps.now()), width, "…"));
+		// The band carries the frame's own side padding so its background reaches the edges.
+		const header = this.headerRows(task, width);
 		const lines = this.threadLines(this.remoteThreads.get(task.id) ?? this.deps.store.thread(task.id), width);
-		if (lines.length === 0) return [header, theme.fg(ROLE.EMPTY, task.error ?? EMPTY_THREAD)];
-		const visible = Math.max(0, rows - 1);
+		if (lines.length === 0) return [...header, theme.fg(ROLE.EMPTY, task.error ?? EMPTY_THREAD)];
+		const visible = Math.max(0, rows - THREAD_HEADER_ROWS);
 		const maxScroll = Math.max(0, lines.length - visible);
 		if (this.follow) this.scroll = maxScroll;
 		// A taller/wider presentation may clamp its window, not the saved position.
 		const start = Math.min(this.scroll, maxScroll);
-		return [header, ...lines.slice(start, start + visible)];
+		return [...header, ...lines.slice(start, start + visible)];
+	}
+
+	/** The banded header: stable fields first, the live step second, so a step change never moves them. */
+	private headerRows(task: TaskRecord, width: number): string[] {
+		// The task row names the agent while the list is on screen. Details replace that
+		// list, so there the band has to carry the identity itself.
+		const fields = taskHeader(task, this.deps.now());
+		const line = this.isNarrow() ? `${task.agent} · ${fields}` : fields;
+		return [
+			this.bandRow(this.deps.theme.fg(ROLE.META, line), width),
+			this.bandRow(this.deps.theme.fg(ROLE.NAME, taskStep(task)), width),
+		];
+	}
+
+	/** One full-width row behind the card's own background, so the two rows read as one block. */
+	private bandRow(text: string, width: number): string {
+		const target = Math.max(0, Math.floor(width));
+		if (target === 0) return "";
+		const clipped = truncateToWidth(text, target, "…");
+		const row = clipped + " ".repeat(Math.max(0, target - visibleWidth(clipped)));
+		const bg = this.deps.theme.bg;
+		if (typeof bg !== "function") return row;
+		try {
+			return bg.call(this.deps.theme, FLOAT_BG_ROLE[CARD_TONE.INFO], row);
+		} catch {
+			return row;
+		}
 	}
 
 	private select(index: number, rows = this.visibleRows(), revealSelection = true): void {
@@ -772,9 +838,28 @@ export class AgentsView {
 		this.deps.requestRender();
 	}
 
-	// One page is the thread area: the body minus its header row.
+	// One page is the thread area: the body minus its two header rows.
 	private pageRows(): number {
-		return Math.max(1, this.bodyRows() - 1);
+		return Math.max(1, this.bodyRows() - THREAD_HEADER_ROWS);
+	}
+
+	private matchesToolOutputToggle(data: string): boolean {
+		const toggle = this.deps.toolOutputToggle;
+		return toggle ? toggle.matches(data) : matchesKey(data, Key.ctrl("o"));
+	}
+
+	private toolOutputHint(): string | undefined {
+		const key = this.deps.toolOutputToggle?.keyText() ?? Key.ctrl("o");
+		if (key.length === 0) return undefined;
+		const theme = this.deps.theme;
+		return `${theme.fg(ROLE.META, key)} ${theme.fg(ROLE.NAME_IDLE, this.toolOutputExpanded ? "to collapse" : "to expand")}`;
+	}
+
+	private toggleToolOutput(): void {
+		this.toolOutputExpanded = !this.toolOutputExpanded;
+		// Every card's rows and hint depend on the fold state, so the render cache is stale.
+		this.cache = new WeakMap();
+		this.deps.requestRender();
 	}
 
 	private scrollBy(delta: number): void {

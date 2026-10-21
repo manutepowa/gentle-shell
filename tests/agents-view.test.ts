@@ -2,8 +2,18 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { emptyThread, TASK_EVENT, TASK_STATUS, TaskStore, type TaskRecord } from "../lib/agents-protocol.ts";
-import { AgentsView, taskHeader } from "../lib/agents-view.ts";
+import { AgentsView, taskHeader, taskStep, type AgentsViewDeps } from "../lib/agents-view.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
+
+// The thread column of a rendered frame, one entry per body row. Content rows
+// carry one cell of frame padding on each side; the header band does not.
+function threadCells(frame: string[]): string[] {
+	return frame.slice(1, -2).map((line) => line.split("│")[2] ?? "");
+}
+
+function threadBands(frame: string[]): string[] {
+	return threadCells(frame).map((cell) => stripAnsi(cell).trim());
+}
 
 // Gentle Agents overlay: list left, selected thread right, tail-following,
 // and only the selected task subscribed.
@@ -14,7 +24,7 @@ function task(id: string, overrides: Partial<TaskRecord> = {}): TaskRecord {
 	return { id, agent: "explore", mode: "task", prompt: "p", label: "p", cwd: "/r", parentSessionId: "s", status: TASK_STATUS.RUNNING, createdAt: 1000, startedAt: 1000, endedAt: null, model: "gpt-5.6-terra", thinking: undefined, sessionPath: "/sessions/x.jsonl", error: null, result: null, lastStep: "grep", lastActivityAt: 1000, turns: 0, toolCalls: 0, tokens: 34_000, cost: 0.27, ...overrides };
 }
 
-function harness(rows: number | (() => number) = 8, sessionId = "s", canCancel?: (task: TaskRecord) => boolean) {
+function harness(rows: number | (() => number) = 8, sessionId = "s", canCancel?: (task: TaskRecord) => boolean, toolOutputToggle?: AgentsViewDeps["toolOutputToggle"]) {
 	const store = new TaskStore();
 	const events: string[] = [];
 	let renders = 0;
@@ -25,6 +35,7 @@ function harness(rows: number | (() => number) = 8, sessionId = "s", canCancel?:
 		sessionId,
 		now: () => 61_000,
 		canCancel,
+		toolOutputToggle,
 		onCancel: (entry) => events.push(`cancel:${entry.id}`),
 		onOpen: (entry) => events.push(`open:${entry.id}`),
 		onClose: () => events.push("close"),
@@ -186,6 +197,8 @@ test("fullscreen retains every semantic block and hides Stop for unowned active 
 	store.restore(task("a"), thread);
 	view.render(60);
 	view.handleInput("F");
+	// Tool output starts folded; the host toggle is how the fullscreen thread shows all of it.
+	view.handleInput("\x0f");
 	for (let i = 0; i < 12; i++) view.handleInput("\x1b[5~");
 	const seen = new Set<string>();
 	for (let i = 0; i < 50; i++) {
@@ -236,12 +249,13 @@ test("the thread pane renders prose as Markdown and a tool call as a card", () =
 	] });
 	view.render(80);
 	const frame = view.render(80).map(stripAnsi).join("\n");
-	assert.match(frame, /│ Answer +│/, "a heading renders as prose, not as a labeled block");
+	assert.match(frame, /│Answer +│/, "a heading renders as prose, flush with the divider, not as a labeled block");
 	assert.doesNotMatch(frame, /\bText\b/, "prose is no longer announced by a block label");
 	assert.match(frame, /◐ bash · ls -la/, "the card header carries the call's identifying argument on one line");
 	assert.match(frame, /Running/, "the card closes with the call's state");
 	assert.match(frame, /↳ Note/, "a note keeps its own card");
-	assert.equal(taskHeader(task("a"), 61_000), "explore · running · gpt-5.6-terra · 34k · $0.270 · 1m00s");
+	assert.equal(taskHeader(task("a"), 61_000), "running · gpt-5.6-terra · 34k · $0.270 · 1m00s", "the header line never carries the live step");
+	assert.equal(taskStep(task("a")), "grep", "the live step is its own row");
 });
 
 test("taskHeader formats subagent cost with formatCost (three decimals below $1, two at or above $1)", () => {
@@ -255,17 +269,18 @@ test("AgentsView renders the frame with the task list and the selected thread's 
 	store.add(task("a"));
 	store.add(task("b", { agent: "worker", status: TASK_STATUS.COMPLETED, endedAt: 5000, createdAt: 900, lastActivityAt: 900 }));
 	for (let index = 0; index < 6; index += 1) store.apply("a", { type: TASK_EVENT.TEXT, text: `line ${index}\n` }, 2000);
-	const lines = view.render(90);
-	for (const line of lines) assert.equal(visibleWidth(line), 90, `"${stripAnsi(line)}" is not 90 wide`);
+	const lines = view.render(120);
+	for (const line of lines) assert.equal(visibleWidth(line), 120, `"${stripAnsi(line)}" is not 120 wide`);
 	const plain = lines.map(stripAnsi);
 	assert.equal(plain.length, 8);
 	assert.match(plain[0], /^╭─ ❀ Agents · this session · 1 active · 1 finished ─+ \[F Fullscreen\] \[× Close\]╮$/);
-	assert.match(plain[1], /▸ └ ◐ Subagent explore.*explore · running · gpt-5\.6-terra · 34k · \$0\.270 · 1m00s/);
-	assert.match(plain[2], /line 3/, "the thread window follows the tail");
-	assert.match(plain[3], /line 4/);
+	assert.match(plain[1], /▸ └ ◐ Subagent explore.*running · gpt-5\.6-terra · 34k · \$0\.270 · 1m00s/, "the header row keeps only the stable fields");
+	assert.match(plain[2], /grep/, "the live step sits on its own band row under the fields");
+	assert.equal(threadBands(plain)[2].trimEnd(), "line 4", "the three-row thread window follows the tail");
+	assert.equal(threadBands(plain)[3].trimEnd(), "line 5");
 	assert.match(plain.join("\n"), /Subagent worker/, "the session's own finished task now stays listed as history");
 	assert.doesNotMatch(plain.join("\n"), /orchestrator/i);
-	assert.match(plain[4], /line 5/);
+	assert.equal(threadBands(plain)[4].trimEnd(), "", "the trailing newline occupies the last thread row");
 	assert.match(plain[6], /\[ Follow \].*\[ Open session \].*\[Stop\]/);
 	assert.match(plain[7], /^╰─+╯$/);
 });
@@ -284,14 +299,14 @@ test("AgentsView keys move the selection, scroll, follow, cancel, open, and clos
 	assert.deepEqual(events, ["cancel:a", "open:a"]);
 	for (let index = 0; index < 12; index += 1) store.apply("a", { type: TASK_EVENT.TEXT, text: `l${index}\n` }, 2000);
 	view.handleInput("\x1b[5~");
-	assert.match(stripAnsi(view.render(80)[2]), /l0 +│$/, "page up leaves follow mode and shows the top of the thread");
+	assert.match(stripAnsi(view.render(80)[3]), /l0 +│$/, "page up leaves follow mode and shows the top of the thread");
 	assert.doesNotMatch(stripAnsi(view.render(80).join("\n")), /l9 +│/, "page up stops showing the tail");
 	view.handleInput("\x0a");
-	assert.match(stripAnsi(view.render(80)[2]), /l4 +│$/, "ctrl+j scrolls one page down");
+	assert.match(stripAnsi(view.render(80)[3]), /l3 +│$/, "ctrl+j scrolls one three-row page down");
 	view.handleInput("\x0b");
-	assert.match(stripAnsi(view.render(80)[2]), /l0 +│$/, "ctrl+k scrolls one page back up");
+	assert.match(stripAnsi(view.render(80)[3]), /l0 +│$/, "ctrl+k scrolls one page back up");
 	view.handleInput("f");
-	assert.match(stripAnsi(view.render(80)[2]), /l9 +│$/, "f follows the tail again");
+	assert.match(stripAnsi(view.render(80)[3]), /l10 +│$/, "f follows the tail again");
 	view.handleInput("\x1b");
 	assert.deepEqual(events, ["cancel:a", "open:a", "close"]);
 });
@@ -373,7 +388,7 @@ function mouse(x: number, y: number, width: number, height: number, type: TuiMou
 }
 
 test("AgentsView pointer regions hover and select task rows without activating, and keep list and thread wheels independent", () => {
-	const { store, view, events } = harness(6);
+	const { store, view, events } = harness(7);
 	for (const id of ["a", "b", "c", "d", "e"]) store.add(task(id, { agent: id }));
 	for (let index = 0; index < 8; index += 1) store.apply("b", { type: TASK_EVENT.TEXT, text: `thread ${index}\n` }, 2000);
 	const lines = view.render(80);
@@ -385,7 +400,7 @@ test("AgentsView pointer regions hover and select task rows without activating, 
 	assert.deepEqual(events, [], "click selects the task only; it never opens or cancels");
 	view.render(80);
 	assert.equal(view.handleMouse(mouse(50, 2, 80, lines.length, "wheel", -1))?.handled, true, "thread wheel is handled by its viewport");
-	assert.match(stripAnsi(view.render(80)[2]), /thread 6/, "thread wheel moves only the selected thread");
+	assert.match(stripAnsi(view.render(80)[3]), /thread 6/, "thread wheel moves only the selected thread");
 	assert.equal(view.handleMouse(mouse(4, 2, 80, lines.length, "wheel", 1))?.handled, true, "list wheel is handled by its viewport");
 	assert.match(stripAnsi(view.render(80)[1]), / b /, "list wheel changes only the task-list viewport");
 	assert.equal(view.handleMouse(mouse(50, 2, 80, lines.length, "click")), undefined, "thread clicks are inert");
@@ -394,7 +409,7 @@ test("AgentsView pointer regions hover and select task rows without activating, 
 });
 
 test("AgentsView retains narrow keyboard mode after selection and store invalidation", () => {
-	const { store, view, events } = harness(6);
+	const { store, view, events } = harness(7);
 	store.add(task("a"));
 	store.add(task("b", { agent: "b" }));
 	for (let index = 0; index < 3; index += 1) store.apply("b", { type: TASK_EVENT.TEXT, text: `thread ${index}\n` }, 2000);
@@ -417,7 +432,7 @@ test("AgentsView retains narrow keyboard mode after selection and store invalida
 });
 
 test("AgentsView narrow drilldown has explicit Back, independent wheel and Open, and global close", () => {
-	const { store, view, events } = harness(6);
+	const { store, view, events } = harness(7);
 	store.add(task("a"));
 	store.add(task("b", { agent: "b" }));
 	for (let index = 0; index < 8; index += 1) store.apply("b", { type: TASK_EVENT.TEXT, text: `thread ${index}\n` }, 2000);
@@ -602,13 +617,13 @@ test("AgentsView footer buttons follow, open only a session-backed selection, an
 	assert.match(stripAnsi(lines.at(-2) ?? ""), /\[ Follow \].*\[ Open session \]/, "buttons render only after the full key-hint row fits");
 
 	view.handleInput("\x1b[5~");
-	assert.match(stripAnsi(view.render(width)[2]), /line 5/, "page up leaves follow mode before the button restores it");
+	assert.match(stripAnsi(view.render(width)[3]), /line 7/, "page up leaves follow mode before the button restores it");
 	assert.equal(view.handleMouse(mouse(followX, footerY, width, lines.length))?.render, true, "button hover requests a distinct frame");
 	assert.equal(view.handleMouse(mouse(followX, footerY, width, lines.length, "press")), undefined, "press is inert");
 	assert.equal(view.handleMouse({ ...mouse(followX, footerY, width, lines.length, "click"), button: "right" }), undefined, "right click is inert");
 	assert.equal(view.handleMouse({ ...mouse(followX, footerY, width, lines.length, "click"), button: "middle" }), undefined, "middle click is inert");
 	assert.equal(view.handleMouse(mouse(followX, footerY, width, lines.length, "click"))?.handled, true);
-	assert.match(stripAnsi(view.render(width)[2]), /line 9/, "Follow returns the selected thread to its tail");
+	assert.match(stripAnsi(view.render(width)[3]), /line 10/, "Follow returns the selected thread to its tail");
 	assert.equal(view.handleMouse(mouse(openX, footerY, width, lines.length, "click"))?.handled, true);
 	assert.deepEqual(events, ["open:a"], "Open delegates the selected task to the existing callback");
 	assert.equal(view.handleMouse(mouse(followX, footerY, width + 1, lines.length, "click")), undefined, "a pre-render resize makes the prior footer geometry inert");
@@ -688,12 +703,121 @@ test("AgentsView rejects cached-height pointer input before the live resize rend
 	for (let index = 0; index < 12; index += 1) store.apply("a", { type: TASK_EVENT.TEXT, text: `l${index}\n` }, 2000);
 	view.handleInput("\x1b[5~");
 	const oldFrame = view.render(80);
-	assert.match(stripAnsi(oldFrame[2] ?? ""), /l0/, "manual scrolling establishes a stable pre-resize position");
+	assert.match(stripAnsi(oldFrame[3] ?? ""), /l0/, "manual scrolling establishes a stable pre-resize position");
 	rows = 6;
 	assert.equal(view.handleMouse(mouse(50, 2, 80, oldFrame.length, "wheel", 1)), undefined, "old-height wheel input is inert before the resize frame");
 	const resized = view.render(80);
-	assert.match(stripAnsi(resized[2] ?? ""), /l0/, "the stale wheel leaves manual thread scroll unchanged");
+	assert.match(stripAnsi(resized[3] ?? ""), /l0/, "the stale wheel leaves manual thread scroll unchanged");
 	assert.equal(view.handleMouse(mouse(50, 2, 80, resized.length, "wheel", 1))?.handled, true, "the new-height wheel reaches the rendered thread region");
-	assert.match(stripAnsi(view.render(80)[2] ?? ""), /l1/, "the live wheel scrolls the thread after the new frame");
+	assert.match(stripAnsi(view.render(80)[3] ?? ""), /l1/, "the live wheel scrolls the thread after the new frame");
 	view.dispose();
+});
+
+test("ctrl+o folds and unfolds tool output in the thread, like the parent transcript", () => {
+	const { store, view } = harness(18);
+	store.add(task("a"));
+	store.apply("a", { type: TASK_EVENT.TOOL_START, callId: "c", name: "bash", args: { command: "ls" } }, 2000);
+	store.apply("a", { type: TASK_EVENT.TOOL_END, callId: "c", output: Array.from({ length: 8 }, (_, index) => `row ${index}`).join("\n"), isError: false }, 2001);
+	const frame = () => stripAnsi(view.render(100).join("\n"));
+	assert.match(frame(), /ctrl\+o to expand/, "the folded card names the host binding that unfolds it");
+	assert.match(frame(), /row 0/);
+	assert.doesNotMatch(frame(), /row 7/, "the collapsed card keeps a three-row preview");
+	view.handleInput("\x0f");
+	assert.match(frame(), /row 7/, "ctrl+o unfolds every tool card in the thread");
+	assert.match(frame(), /ctrl\+o to collapse/);
+	view.handleInput("\x0f");
+	assert.doesNotMatch(frame(), /row 7/, "ctrl+o folds them again");
+	assert.match(frame(), /ctrl\+o to expand/);
+	view.dispose();
+});
+
+test("the thread honors the host's remapped tool-output key and names it in the hint", () => {
+	const { store, view } = harness(18, "s", undefined, { matches: (data) => data === "\x07", keyText: () => "ctrl+g" });
+	store.add(task("a"));
+	store.apply("a", { type: TASK_EVENT.TOOL_START, callId: "c", name: "bash", args: { command: "ls" } }, 2000);
+	store.apply("a", { type: TASK_EVENT.TOOL_END, callId: "c", output: Array.from({ length: 8 }, (_, index) => `row ${index}`).join("\n"), isError: false }, 2001);
+	const frame = () => stripAnsi(view.render(100).join("\n"));
+	assert.match(frame(), /ctrl\+g to expand/, "the hint names the key the host actually bound");
+	view.handleInput("\x0f");
+	assert.doesNotMatch(frame(), /row 7/, "the default key is inert once the host remaps it");
+	view.handleInput("\x07");
+	assert.match(frame(), /row 7/, "the remapped key unfolds the thread");
+	assert.match(frame(), /ctrl\+g to collapse/);
+	view.dispose();
+});
+
+test("the thread header is a two-row band: stable fields above, the live step below", () => {
+	const { store, view } = harness(12);
+	store.add(task("a", { lastStep: "bash" }));
+	const cells = threadCells(view.render(100));
+	const body = threadBands(view.render(100));
+	assert.equal(body[0], "running · gpt-5.6-terra · 34k · $0.270 · 1m00s", "the first row carries only fields that never change with the step");
+	assert.equal(body[1], "bash", "the second row carries the live step alone");
+	assert.equal(visibleWidth(cells[0]), visibleWidth(cells[1]), "both band rows span the thread column so nothing shifts sideways");
+	assert.equal(threadCells(view.render(100))[2].startsWith(" "), false, "the thread content below the band is flush with the divider too");
+	view.dispose();
+});
+
+test("both header rows wear the card background across the whole thread column", () => {
+	const store = new TaskStore();
+	const BG = "\u001b[48;5;22m";
+	const view = new AgentsView({
+		theme: { fg: (_color: string, text: string) => text, bg: (color: string, text: string) => color === "toolSuccessBg" ? `${BG}${text}\u001b[49m` : text },
+		rows: 12, store, sessionId: "s", now: () => 61_000,
+		onCancel() {}, onOpen() {}, onClose() {}, requestRender() {},
+	});
+	store.add(task("a", { lastStep: "bash" }));
+	const cells = threadCells(view.render(100));
+	for (const [index, cell] of cells.slice(0, 2).entries()) {
+		assert.equal(cell.startsWith(BG), true, `header row ${index} paints its background from the frame edge, with no padding`);
+		assert.equal(visibleWidth(stripAnsi(cell)), visibleWidth(stripAnsi(cells[0])), `header row ${index} paints the band to the column edge`);
+	}
+	assert.equal(cells[2].includes(BG), false, "only the band is painted, not the thread below it");
+	view.dispose();
+});
+
+test("a step identical to the status leaves a blank band row instead of repeating it", () => {
+	const { store, view } = harness(12);
+	store.add(task("a", { status: TASK_STATUS.QUEUED, lastStep: TASK_STATUS.QUEUED, startedAt: null }));
+	const body = threadBands(view.render(100).map(stripAnsi));
+	assert.equal(taskStep(task("a", { status: TASK_STATUS.QUEUED, lastStep: TASK_STATUS.QUEUED })), "", "the step never repeats the status");
+	assert.equal(body[1], "", "the band keeps an empty second row so nothing below it moves");
+	assert.equal(visibleWidth(threadCells(view.render(100))[1]), visibleWidth(threadCells(view.render(100))[0]), "the empty row still spans the thread column");
+	view.dispose();
+});
+
+test("the band survives a task with no thread items and names the current step", () => {
+	const { store, view } = harness(12);
+	store.add(task("a", { lastStep: "grep" }));
+	const body = threadBands(view.render(100).map(stripAnsi));
+	assert.equal(body[1], "grep");
+	assert.equal(body[2].trim(), "waiting for the first event", "the empty-thread message sits under the band");
+	view.dispose();
+});
+
+test("the band reaches both frame edges in fullscreen narrow details", () => {
+	const BG = "\u001b[48;5;22m";
+	const store = new TaskStore();
+	const view = new AgentsView({
+		theme: { fg: (_color: string, text: string) => text, bg: (color: string, text: string) => color === "toolSuccessBg" ? `${BG}${text}\u001b[49m` : text },
+		rows: 10, store, sessionId: "s", now: () => 61_000,
+		onCancel() {}, onOpen() {}, onClose() {}, requestRender() {},
+	});
+	store.add(task("a", { lastStep: "bash" }));
+	view.render(40);
+	// Narrow mode enters details with Enter/Tab; the fullscreen key is inert there.
+	view.handleInput("\t");
+	const frame = view.render(40);
+	const cells = frame.slice(1, -2).map((line) => line.split("│")[1] ?? "");
+	assert.equal(cells[0].startsWith(BG), true, "the band starts at the frame, with no padding cell");
+	assert.equal(visibleWidth(stripAnsi(cells[0])), 38, "the band spans the whole inner width");
+	assert.equal(visibleWidth(stripAnsi(cells[1])), 38, "both band rows span it");
+	for (const line of frame) assert.equal(visibleWidth(line), 40, "the full-bleed row never widens the frame");
+	view.dispose();
+});
+
+test("the thread header carries the model with its effort and never repeats the agent", () => {
+	assert.equal(taskHeader(task("a", { thinking: "low" }), 61_000), "running · gpt-5.6-terra · low · 34k · $0.270 · 1m00s", "the effort rides with the model it belongs to");
+	assert.equal(taskHeader(task("a"), 61_000), "running · gpt-5.6-terra · 34k · $0.270 · 1m00s", "a task without a recorded effort omits it");
+	assert.doesNotMatch(taskHeader(task("a", { thinking: "high" }), 61_000), /explore/, "the list row already names the agent, so the header does not repeat it");
 });

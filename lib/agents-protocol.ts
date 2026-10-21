@@ -47,6 +47,14 @@ export const THREAD_ITEM = {
 
 export type ThreadItemKind = (typeof THREAD_ITEM)[keyof typeof THREAD_ITEM];
 
+/** How a note reads: an ordinary notice, or a failure the operator must see. */
+export const NOTE_SEVERITY = {
+	INFO: "info",
+	ERROR: "error",
+} as const;
+
+export type NoteSeverity = (typeof NOTE_SEVERITY)[keyof typeof NOTE_SEVERITY];
+
 export interface AskRequest {
 	id: string;
 	method: string;
@@ -68,7 +76,7 @@ export interface AgentEndEvent {
 export interface AgentSettledEvent { type: typeof TASK_EVENT.AGENT_SETTLED }
 export interface ErrorEvent { type: typeof TASK_EVENT.ERROR; message: string }
 export interface AskEvent { type: typeof TASK_EVENT.ASK; request: AskRequest }
-export interface NoteEvent { type: typeof TASK_EVENT.NOTE; text: string }
+export interface NoteEvent { type: typeof TASK_EVENT.NOTE; text: string; severity?: NoteSeverity }
 export interface UsageEvent { type: typeof TASK_EVENT.USAGE; tokens: number; cost: number }
 
 export type ChildUnavailable = Readonly<{ state: "unavailable" }>;
@@ -93,7 +101,7 @@ export type TaskEvent = ResponseObservationEvent | TextEvent | ThinkingEvent | T
 export interface TextItem { kind: typeof THREAD_ITEM.TEXT; text: string }
 export interface ThinkingItem { kind: typeof THREAD_ITEM.THINKING; text: string }
 export interface ToolItem { kind: typeof THREAD_ITEM.TOOL; callId: string; name: string; args: Record<string, unknown>; output: string; running: boolean; isError: boolean }
-export interface NoteItem { kind: typeof THREAD_ITEM.NOTE; text: string }
+export interface NoteItem { kind: typeof THREAD_ITEM.NOTE; text: string; severity?: NoteSeverity }
 
 export type ThreadItem = TextItem | ThinkingItem | ToolItem | NoteItem;
 
@@ -351,7 +359,7 @@ export function normalizeRpcEvent(raw: unknown, options: { observeResponses?: bo
 		case "auto_retry_start":
 			return [{ type: TASK_EVENT.NOTE, text: `retrying (${String(event.attempt ?? "?")}/${String(event.maxAttempts ?? "?")})` }];
 		case "extension_error":
-			return [{ type: TASK_EVENT.NOTE, text: `extension error: ${clean(event.error)}` }];
+			return [{ type: TASK_EVENT.NOTE, text: `extension error: ${clean(event.error)}`, severity: NOTE_SEVERITY.ERROR }];
 		default:
 			return [];
 	}
@@ -420,11 +428,14 @@ export function applyTaskEvent(thread: TaskThread, event: TaskEvent): TaskThread
 		case TASK_EVENT.TOOL_END:
 			return updateTool(thread, event.callId, { output: event.output, running: false, isError: event.isError });
 		case TASK_EVENT.ERROR:
-			return push(thread, { kind: THREAD_ITEM.NOTE, text: `error: ${event.message}` });
+			return push(thread, { kind: THREAD_ITEM.NOTE, text: `error: ${event.message}`, severity: NOTE_SEVERITY.ERROR });
 		case TASK_EVENT.ASK:
 			return push(thread, { kind: THREAD_ITEM.NOTE, text: askNote(event.request) });
 		case TASK_EVENT.NOTE:
-			return push(thread, { kind: THREAD_ITEM.NOTE, text: clean(event.text) });
+			// Omitting the field keeps a persisted informational note byte-identical to before.
+			return push(thread, event.severity === undefined
+				? { kind: THREAD_ITEM.NOTE, text: clean(event.text) }
+				: { kind: THREAD_ITEM.NOTE, text: clean(event.text), severity: event.severity });
 		default:
 			return thread;
 	}
