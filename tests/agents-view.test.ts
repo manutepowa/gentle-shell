@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { emptyThread, TASK_EVENT, TASK_STATUS, TaskStore, type TaskRecord } from "../lib/agents-protocol.ts";
-import { AgentsView, taskHeader } from "../lib/agents-view.ts";
+import { AgentsView, taskHeader, type AgentsViewDeps } from "../lib/agents-view.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 
 // Gentle Agents overlay: list left, selected thread right, tail-following,
@@ -14,7 +14,7 @@ function task(id: string, overrides: Partial<TaskRecord> = {}): TaskRecord {
 	return { id, agent: "explore", mode: "task", prompt: "p", label: "p", cwd: "/r", parentSessionId: "s", status: TASK_STATUS.RUNNING, createdAt: 1000, startedAt: 1000, endedAt: null, model: "gpt-5.6-terra", thinking: undefined, sessionPath: "/sessions/x.jsonl", error: null, result: null, lastStep: "grep", lastActivityAt: 1000, turns: 0, toolCalls: 0, tokens: 34_000, cost: 0.27, ...overrides };
 }
 
-function harness(rows: number | (() => number) = 8, sessionId = "s", canCancel?: (task: TaskRecord) => boolean) {
+function harness(rows: number | (() => number) = 8, sessionId = "s", canCancel?: (task: TaskRecord) => boolean, toolOutputToggle?: AgentsViewDeps["toolOutputToggle"]) {
 	const store = new TaskStore();
 	const events: string[] = [];
 	let renders = 0;
@@ -25,6 +25,7 @@ function harness(rows: number | (() => number) = 8, sessionId = "s", canCancel?:
 		sessionId,
 		now: () => 61_000,
 		canCancel,
+		toolOutputToggle,
 		onCancel: (entry) => events.push(`cancel:${entry.id}`),
 		onOpen: (entry) => events.push(`open:${entry.id}`),
 		onClose: () => events.push("close"),
@@ -186,6 +187,8 @@ test("fullscreen retains every semantic block and hides Stop for unowned active 
 	store.restore(task("a"), thread);
 	view.render(60);
 	view.handleInput("F");
+	// Tool output starts folded; the host toggle is how the fullscreen thread shows all of it.
+	view.handleInput("\x0f");
 	for (let i = 0; i < 12; i++) view.handleInput("\x1b[5~");
 	const seen = new Set<string>();
 	for (let i = 0; i < 50; i++) {
@@ -722,5 +725,38 @@ test("AgentsView rejects cached-height pointer input before the live resize rend
 	assert.match(stripAnsi(resized[2] ?? ""), /l0/, "the stale wheel leaves manual thread scroll unchanged");
 	assert.equal(view.handleMouse(mouse(50, 2, 80, resized.length, "wheel", 1))?.handled, true, "the new-height wheel reaches the rendered thread region");
 	assert.match(stripAnsi(view.render(80)[2] ?? ""), /l1/, "the live wheel scrolls the thread after the new frame");
+	view.dispose();
+});
+
+test("ctrl+o folds and unfolds tool output in the thread, like the parent transcript", () => {
+	const { store, view } = harness(18);
+	store.add(task("a"));
+	store.apply("a", { type: TASK_EVENT.TOOL_START, callId: "c", name: "bash", args: { command: "ls" } }, 2000);
+	store.apply("a", { type: TASK_EVENT.TOOL_END, callId: "c", output: Array.from({ length: 8 }, (_, index) => `row ${index}`).join("\n"), isError: false }, 2001);
+	const frame = () => stripAnsi(view.render(100).join("\n"));
+	assert.match(frame(), /ctrl\+o to expand/, "the folded card names the host binding that unfolds it");
+	assert.match(frame(), /row 0/);
+	assert.doesNotMatch(frame(), /row 7/, "the collapsed card keeps a three-row preview");
+	view.handleInput("\x0f");
+	assert.match(frame(), /row 7/, "ctrl+o unfolds every tool card in the thread");
+	assert.match(frame(), /ctrl\+o to collapse/);
+	view.handleInput("\x0f");
+	assert.doesNotMatch(frame(), /row 7/, "ctrl+o folds them again");
+	assert.match(frame(), /ctrl\+o to expand/);
+	view.dispose();
+});
+
+test("the thread honors the host's remapped tool-output key and names it in the hint", () => {
+	const { store, view } = harness(18, "s", undefined, { matches: (data) => data === "\x07", keyText: () => "ctrl+g" });
+	store.add(task("a"));
+	store.apply("a", { type: TASK_EVENT.TOOL_START, callId: "c", name: "bash", args: { command: "ls" } }, 2000);
+	store.apply("a", { type: TASK_EVENT.TOOL_END, callId: "c", output: Array.from({ length: 8 }, (_, index) => `row ${index}`).join("\n"), isError: false }, 2001);
+	const frame = () => stripAnsi(view.render(100).join("\n"));
+	assert.match(frame(), /ctrl\+g to expand/, "the hint names the key the host actually bound");
+	view.handleInput("\x0f");
+	assert.doesNotMatch(frame(), /row 7/, "the default key is inert once the host remaps it");
+	view.handleInput("\x07");
+	assert.match(frame(), /row 7/, "the remapped key unfolds the thread");
+	assert.match(frame(), /ctrl\+g to collapse/);
 	view.dispose();
 });

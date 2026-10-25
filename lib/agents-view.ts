@@ -24,6 +24,13 @@ export const VIEW_SCOPE = {
 
 export type ViewScope = (typeof VIEW_SCOPE)[keyof typeof VIEW_SCOPE];
 
+/** The host's `app.tools.expand` action: the same toggle the parent transcript uses. */
+export interface ToolOutputToggle {
+	matches(data: string): boolean;
+	/** The binding as the host displays it, empty when the host disabled the action. */
+	keyText(): string;
+}
+
 export interface AgentsViewDeps {
 	theme: AgentsViewTheme;
 	rows: number | (() => number);
@@ -34,6 +41,8 @@ export interface AgentsViewDeps {
 	onCancel(task: TaskRecord): void;
 	canCancel?(task: TaskRecord): boolean;
 	isLocalTask?(task: TaskRecord): boolean;
+	/** Absent outside a Pi TUI, which keeps the default binding without a host to resolve it. */
+	toolOutputToggle?: ToolOutputToggle;
 	onOpen(task: TaskRecord): void;
 	onClose(): void;
 	requestRender(): void;
@@ -166,6 +175,8 @@ export class AgentsView {
 	private scope: ViewScope;
 	private scroll = 0;
 	private follow = true;
+	// Tool calls start folded, exactly like the parent transcript's tool output.
+	private toolOutputExpanded = false;
 	private readonly pointerScope = createNativePointerScope();
 	private readonly taskRegions = new Map<number, NativePointerRegion>();
 	private readonly listRegion: NativePointerRegion;
@@ -329,6 +340,7 @@ export class AgentsView {
 		if (this.closed) return;
 		if (data === "q") return this.close();
 		if (matchesKey(data, Key.escape)) return this.back();
+		if (this.matchesToolOutputToggle(data)) return this.toggleToolOutput();
 		if (data === "F" && !this.isNarrow()) {
 			this.setNarrowView(this.narrowView === "list" ? "details" : "list");
 			return;
@@ -724,10 +736,11 @@ export class AgentsView {
 		}
 		const lines: string[] = [];
 		if (thread.dropped > 0) lines.push(this.deps.theme.fg(ROLE.META, `… ${thread.dropped} earlier items not kept`));
+		const hint = this.toolOutputHint();
 		for (const item of thread.items) {
 			let rendered = this.cache.get(item);
 			if (!rendered) {
-				rendered = renderThreadItem(item, this.deps.theme, width);
+				rendered = renderThreadItem(item, this.deps.theme, width, { expanded: this.toolOutputExpanded, hint });
 				this.cache.set(item, rendered);
 			}
 			lines.push(...rendered);
@@ -775,6 +788,25 @@ export class AgentsView {
 	// One page is the thread area: the body minus its header row.
 	private pageRows(): number {
 		return Math.max(1, this.bodyRows() - 1);
+	}
+
+	private matchesToolOutputToggle(data: string): boolean {
+		const toggle = this.deps.toolOutputToggle;
+		return toggle ? toggle.matches(data) : matchesKey(data, Key.ctrl("o"));
+	}
+
+	private toolOutputHint(): string | undefined {
+		const key = this.deps.toolOutputToggle?.keyText() ?? Key.ctrl("o");
+		if (key.length === 0) return undefined;
+		const theme = this.deps.theme;
+		return `${theme.fg(ROLE.META, key)} ${theme.fg(ROLE.NAME_IDLE, this.toolOutputExpanded ? "to collapse" : "to expand")}`;
+	}
+
+	private toggleToolOutput(): void {
+		this.toolOutputExpanded = !this.toolOutputExpanded;
+		// Every card's rows and hint depend on the fold state, so the render cache is stale.
+		this.cache = new WeakMap();
+		this.deps.requestRender();
 	}
 
 	private scrollBy(delta: number): void {
