@@ -815,7 +815,7 @@ test("native fullscreen header survives narrow and bottom transitions without re
 		const { frame, transcriptRenders } = f.frame(width);
 		assert.equal(transcriptRenders, 1, "native transcript paints only once");
 		assert.equal(frame.primaryScrollView, f.primary);
-		assert.match(frame.lines[0] ?? "", new RegExp(`HEADER ${status === "right" && width >= 140 ? width - 2 : width}`));
+		assert.match(frame.lines[0] ?? "", new RegExp(`HEADER ${width}`));
 		assert.ok(frame.lines.some((line) => line.includes("Editor")), "native editor survives");
 		assert.equal(frame.root.children.some((box) => box.component instanceof ScrollView && box.component !== f.primary), false, "no extra root scroll view");
 	}
@@ -989,7 +989,7 @@ test("an active header wraps the hstack in a vstack and removes the banner from 
 	// The rail card ends two columns before the terminal edge (its padding plus
 	// the scrollbar column); the header stops there too so its right group
 	// lines up with the card border instead of touching the edge.
-	assert.deepEqual(header.render(0), ["HEADER 138"], "the header renders at the terminal width minus the rail's right inset, not the rail width");
+	assert.deepEqual(header.render(0), ["HEADER 140"], "the header renders at the terminal width, not the rail width");
 
 	const hstack = hstackOf(f);
 	assert.equal(hstack.type, "hstack");
@@ -1084,7 +1084,7 @@ test("the header leaf carries the rule row: a two-line header renders both lines
 	const node = f.root[NODE]() as unknown as { type: string; entries: { component: Component }[] };
 	assert.equal(node.type, "vstack", "a two-line header still wraps the hstack in a vstack");
 	const header = node.entries[0]!.component as { render(width: number): string[] };
-	assert.deepEqual(header.render(0), ["HEADER 138", "RULE 138"], "both the status line and the rule row reach the layout, rendered at the terminal width minus the rail's right inset");
+	assert.deepEqual(header.render(0), ["HEADER 140", "RULE 140"], "both the status line and the rule row reach the layout, rendered at the full terminal width");
 });
 
 test("below the sidebar breakpoint a rule-like header paints above native layout without a rail", (t) => {
@@ -1237,7 +1237,7 @@ test("a status bar part paints one full-width row below the transcript and the r
 	assert.match(frame.lines.at(-1)!, /^STATUS BAR/, "the status bar is the last row, under the rail too");
 	assert.match(frame.lines[1]!, /CONVERSATION/, "the transcript starts immediately below the title");
 	assert.ok(frame.lines.slice(1, -1).some((line) => /Status/.test(line)), "the rail sits above the status bar");
-	assert.equal(widthSeen, 160 - 2, "rendered at the header's width");
+	assert.equal(widthSeen, 160, "rendered at the header's width");
 });
 
 test("below the rail breakpoint the status bar row stays only while its part paints one (mobile)", (t) => {

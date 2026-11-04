@@ -11,9 +11,8 @@ const RAIL_WIDTH = 50;
 const RAIL_PADDING = 1;
 // The rail's ScrollView keeps one column for its scrollbar; with the rail
 // padding that puts the card's right border two columns in from the edge.
-// The header row stops at the same column so its right group lines up with
-// the card instead of touching the terminal edge.
-const HEADER_RIGHT_INSET = RAIL_PADDING + 1;
+// The header and status rows span the full terminal width so their panel
+// background reaches the last column.
 const GAP = 3;
 /** Right-edge columns the painting rail takes from the editor column; published as `railColumns`. */
 export const SIDEBAR_RAIL_COLUMNS = RAIL_WIDTH + GAP;
@@ -288,7 +287,7 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 			// the terminal width (minus the rail's right inset), never the
 			// 50-column rail's content width.
 			const headerPart = state.parts.get("header");
-			const preparedHeaderLines = [...(headerPart?.render(Math.max(0, width - HEADER_RIGHT_INSET)) ?? [])];
+			const preparedHeaderLines = [...(headerPart?.render(Math.max(0, width)) ?? [])];
 			const headerActive = headerPart !== undefined && preparedHeaderLines.some((line) => line.trim() !== "");
 			const contentWidth = scroll.getContentWidth(RAIL_WIDTH);
 			// Live work first, then the session Status sections (design/shell-rework/02-proposal.html).
@@ -345,7 +344,7 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 			const active = railLines.length > 0 && railLines.every((line) => visibleWidth(line) <= contentWidth);
 			headerLines = headerActive && headerPlacement() === "top" ? preparedHeaderLines : [];
 			const statusPart = state.parts.get("statusbar");
-			const preparedStatusLines = active && statusPart ? [...(statusPart.render(Math.max(0, width - HEADER_RIGHT_INSET)) ?? [])] : [];
+			const preparedStatusLines = active && statusPart ? [...(statusPart.render(Math.max(0, width)) ?? [])] : [];
 			statusLines = preparedStatusLines.some((line) => line.trim() !== "") ? preparedStatusLines : [];
 			prepared = { revision: cache.revision, width, mode: host.mode, headerPlacement: headerPlacement(), cardStyle: style, root, theme, themeSignature: signature, parts, digests, contentWidth, active, lines: railLines, hits, headerLines, statusLines, fillRow, headerActive: headerLines.length > 0 };
 			state.active = active;
