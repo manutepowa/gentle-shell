@@ -134,15 +134,16 @@ function argSummary(args: Record<string, unknown>): string {
 interface ToolState {
 	tone: CardTone;
 	glyph: string;
-	status: string;
+	/** Named in the border only while the call is live; a finished glyph already says it. */
+	status?: string;
 }
 
 // The same state glyphs the Agents card uses, so a running call reads the same
 // way in the card above the editor and inside the thread.
 function toolState(item: ToolItem): ToolState {
-	if (item.isError) return { tone: CARD_TONE.ERROR, glyph: "✗", status: "Error" };
+	if (item.isError) return { tone: CARD_TONE.ERROR, glyph: "✗" };
 	if (item.running) return { tone: CARD_TONE.INFO, glyph: "◐", status: "Running" };
-	return { tone: CARD_TONE.INFO, glyph: "✓", status: "Complete" };
+	return { tone: CARD_TONE.INFO, glyph: "✓" };
 }
 
 /** How one thread item is drawn: the host's fold state and the hint that names its binding. */
@@ -154,7 +155,7 @@ export interface ThreadRenderOptions {
 }
 
 /** Every retained output line, indented and wrapped so nothing is clipped. */
-function outputRows(item: ToolItem, cardWidth: number): string[] {
+function wrappedOutput(item: ToolItem, cardWidth: number): string[] {
 	if (item.output.length === 0) return [];
 	const width = Math.max(1, cardInnerWidth(cardWidth) - OUTPUT_INDENT);
 	const prefix = " ".repeat(OUTPUT_INDENT);
@@ -165,19 +166,41 @@ function outputRows(item: ToolItem, cardWidth: number): string[] {
 	});
 }
 
+/** The folded preview: one row per source line, cut with an ellipsis rather than wrapped. Output is not prose. */
+function previewOutput(item: ToolItem, cardWidth: number): string[] {
+	const width = Math.max(1, cardInnerWidth(cardWidth) - OUTPUT_INDENT);
+	const prefix = " ".repeat(OUTPUT_INDENT);
+	return item.output.split("\n").slice(0, PREVIEW_ROWS)
+		.map((source) => (source.length === 0 ? "" : `${prefix}${truncateToWidth(source, width, "…")}`));
+}
+
+/** A call with nothing to show is one row, not an empty card. */
+function callRow(item: ToolItem, state: ToolState, theme: AgentsThreadTheme, width: number): string[] {
+	const title = singleLine(item.name) || "tool";
+	const tail = state.status === undefined ? "" : " · running…";
+	const lead = `${state.glyph} ${title}`;
+	const summary = argSummary(item.args);
+	const room = width - visibleWidth(lead) - visibleWidth(tail) - 3;
+	const shown = summary.length === 0 || room < 2 ? "" : ` · ${truncateToWidth(summary, room, "…")}`;
+	const rest = truncateToWidth(`${title}${shown}${tail}`, Math.max(1, width - 2), "…");
+	return [`${paint(theme, state.tone)(state.glyph)} ${paint(theme, PROSE.NOTE)(rest)}`];
+}
+
 function toolLines(item: ToolItem, theme: AgentsThreadTheme, width: number, options: ThreadRenderOptions): string[] {
 	const state = toolState(item);
+	if (item.output.length === 0) return callRow(item, state, theme, width);
+	const expanded = options.expanded === true;
 	return floatRows(state.tone, theme, width, (cardWidth) => {
 		const title = singleLine(item.name) || "tool";
 		const summary = argSummary(item.args);
 		const room = Math.max(8, cardWidth - visibleWidth(title) - 16);
 		const subtitle = summary.length === 0 ? undefined : truncateToWidth(summary, room, "…");
-		const body = outputRows(item, cardWidth);
-		// A call with nothing to show has nothing to fold, so it never advertises the toggle.
-		const hint = body.length === 0 ? undefined : foldHint(options.hint, options.expanded === true ? 0 : body.length - PREVIEW_ROWS);
+		const full = wrappedOutput(item, cardWidth);
+		const body = expanded ? full : previewOutput(item, cardWidth);
+		const hint = foldHint(options.hint, expanded ? 0 : full.length - body.length);
 		return {
 			head: [cardTop({ title, subtitle, body: [], tone: state.tone, glyph: state.glyph }, theme, cardWidth, hint)],
-			...(body.length > 0 ? { body: cardBodyRows(body, state.tone, theme, cardWidth, { expanded: options.expanded === true, previewRows: PREVIEW_ROWS }) } : {}),
+			body: cardBodyRows(body, state.tone, theme, cardWidth, { expanded: true }),
 			bottom: cardBottom(state.tone, theme, cardWidth, state.status),
 		};
 	});
@@ -197,16 +220,21 @@ function thinkingLines(text: string, theme: AgentsThreadTheme, width: number, op
 	return [paint(theme, PROSE.LABEL)(label), ...(folded ? body.slice(0, PREVIEW_ROWS) : body)];
 }
 
-// A note is a notice, unless the child reported a failure: then it wears the
-// error card, so a reader scanning the thread never mistakes it for chatter.
+// A note is one muted row, unless the child reported a failure: then it wears
+// the error card, so a reader scanning the thread never mistakes it for chatter.
 function noteLines(text: string, theme: AgentsThreadTheme, width: number, severity?: NoteSeverity): string[] {
-	const failed = severity === NOTE_SEVERITY.ERROR;
-	const tone = failed ? CARD_TONE.ERROR : CARD_TONE.INFO;
+	if (severity !== NOTE_SEVERITY.ERROR) {
+		const hang = "  ";
+		return text.split("\n").flatMap((source, index) => {
+			const wrapped = wrapTextWithAnsi(source, Math.max(1, width - hang.length));
+			return (wrapped.length > 0 ? wrapped : [""]).map((row, at) => paint(theme, PROSE.NOTE)(index === 0 && at === 0 ? `↳ ${row}` : `${hang}${row}`));
+		});
+	}
+	const tone = CARD_TONE.ERROR;
 	const rows = text.split("\n");
 	return floatRows(tone, theme, width, (cardWidth) => ({
-		head: [cardTop({ title: failed ? "Error" : "Note", body: [], tone, glyph: failed ? "✗" : "↳" }, theme, cardWidth)],
-		body: cardBodyRows(rows.map((row) => (row === "" ? "" : paint(theme, failed ? CARD_TONE.ERROR : PROSE.NOTE)(row))), tone, theme, cardWidth,
-			{ expanded: true }),
+		head: [cardTop({ title: "Error", body: [], tone, glyph: "✗" }, theme, cardWidth)],
+		body: cardBodyRows(rows.map((row) => (row === "" ? "" : paint(theme, tone)(row))), tone, theme, cardWidth, { expanded: true }),
 		bottom: cardBottom(tone, theme, cardWidth),
 	}));
 }

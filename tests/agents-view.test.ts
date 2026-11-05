@@ -243,7 +243,8 @@ test("the thread pane renders prose as Markdown and a tool call as a card", () =
 	assert.doesNotMatch(frame, /\bText\b/, "prose is no longer announced by a block label");
 	assert.match(frame, /◐ bash · ls -la/, "the card header carries the call's identifying argument on one line");
 	assert.match(frame, /Running/, "the card closes with the call's state");
-	assert.match(frame, /↳ Note/, "a note keeps its own card");
+	assert.match(frame, /↳ keep this/, "a note is one row under the call");
+	assert.doesNotMatch(frame, /↳ Note/, "an informational note no longer gets a card of its own");
 	assert.equal(taskHeader(task("a"), 61_000), "explore · running · gpt-5.6-terra · 34k · $0.270 · 1m00s");
 });
 

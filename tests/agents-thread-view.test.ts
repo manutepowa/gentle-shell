@@ -46,19 +46,25 @@ test("a folded card hides nothing behind a hint when it has no output", () => {
 	assert.equal(lines[0].includes("ctrl+o"), false, `a card with no output has nothing to fold: "${lines[0]}"`);
 });
 
-test("a finished call reads Complete and a failed call takes the error tone", () => {
+test("a finished call shows the success glyph and a failed call takes the error tone", () => {
 	const done = renderThreadItem({ kind: "tool", callId: "call", name: "read", args: { path: "a.ts" }, output: "ok", running: false, isError: false }, plainTheme, 44);
 	assert.equal(done[0].startsWith("╭─ ✓ read · a.ts "), true, `completed calls show the success glyph: "${done[0]}"`);
-	assert.equal(done.at(-2)?.endsWith("Complete ╯"), true);
+	assert.equal(done.at(-2)?.includes("Complete"), false, `a finished call says its state once, in the glyph: "${done.at(-2)}"`);
+	assert.equal(done.at(-2)?.startsWith("╰─"), true);
 	const failed = renderThreadItem({ kind: "tool", callId: "call", name: "read", args: { path: "a.ts" }, output: "boom", running: false, isError: true }, taggedTheme, 44);
 	assert.equal(failed[0].startsWith("[error]╭[error]─ [error]✗ read"), true, `failed calls paint the frame with the error role: "${failed[0]}"`);
-	assert.equal(failed.at(-2)?.includes("[dim]Error"), true, `failed calls close with the error status: "${failed.at(-2)}"`);
+	assert.equal(failed.at(-2)?.includes("Error"), false, `a failed call does not repeat its glyph as a word: "${failed.at(-2)}"`);
+	assert.equal(failed.at(-2)?.startsWith("[error]╰"), true, `its bottom rule keeps the error role: "${failed.at(-2)}"`);
 });
 
-test("a call without output renders just its card head and bottom", () => {
-	const lines = renderThreadItem({ kind: "tool", callId: "call", name: "read", args: { path: "a.ts" }, output: "", running: true, isError: false }, plainTheme, 44);
-	assert.deepEqual(lines.map((line) => line.slice(0, 2)), ["╭─", "╰─", ""]);
-	assert.equal(lines[0].startsWith("╭─ ◐ read · a.ts "), true);
+test("a call without output is one row, not an empty card", () => {
+	const running = renderThreadItem({ kind: "tool", callId: "call", name: "read", args: { path: "a.ts" }, output: "", running: true, isError: false }, plainTheme, 44);
+	assert.deepEqual(running, ["◐ read · a.ts · running…", ""]);
+	const done = renderThreadItem({ kind: "tool", callId: "call", name: "read", args: { path: "a.ts" }, output: "", running: false, isError: false }, plainTheme, 44);
+	assert.deepEqual(done, ["✓ read · a.ts", ""]);
+	const long = renderThreadItem({ kind: "tool", callId: "call", name: "read", args: { path: "/very/long/path/to/some/file.ts" }, output: "", running: true, isError: false }, plainTheme, 30);
+	assert.equal(long[0].includes("running…"), true, `the live mark survives truncation: "${long[0]}"`);
+	fits(long, 30);
 });
 
 test("every retained tool-output line survives across terminal widths once unfolded", () => {
@@ -90,12 +96,12 @@ test("the protocol's retention marker reaches the view unchanged and no terminal
 	fits(lines, 60);
 });
 
-test("thinking reads dim under its label and a note keeps its card", () => {
+test("thinking reads dim under its label and an informational note is one muted row", () => {
 	assert.deepEqual(renderThreadItem({ kind: "thinking", text: "one\n\ntwo" }, taggedTheme, 30),
 		["[customMessageLabel]Thinking", "  [dim]one", "", "  [dim]two", ""]);
-	const note = renderThreadItem({ kind: "note", text: "keep this" }, plainTheme, 30);
-	assert.equal(note[0].startsWith("╭─ ↳ Note "), true, `notes stay recognizable: "${note[0]}"`);
-	assert.equal(note[1], "│ keep this                  │");
+	assert.deepEqual(renderThreadItem({ kind: "note", text: "keep this" }, taggedTheme, 30), ["[muted]↳ keep this", ""]);
+	assert.deepEqual(renderThreadItem({ kind: "note", text: "a note long enough to wrap" }, plainTheme, 16),
+		["↳ a note long", "  enough to wrap", ""], "a long note wraps under a hanging indent");
 });
 
 test("a zero width or an unknown kind renders nothing", () => {
@@ -108,7 +114,7 @@ test("an error note takes the error card, and a note without severity stays info
 	assert.equal(failed[0].startsWith("[error]╭[error]─ [error]✗ Error"), true, `an error note reads as an error: "${failed[0]}"`);
 	assert.equal(failed[1].startsWith("[error]"), true, "its body takes the error role too");
 	const legacy = renderThreadItem({ kind: "note", text: "keep this" }, plainTheme, 30);
-	assert.equal(legacy[0].startsWith("╭─ ↳ Note "), true, "a note without severity keeps the informational card");
+	assert.equal(legacy[0], "↳ keep this", "a note without severity stays an informational row, not an error card");
 });
 
 test("thinking folds to three rows by default and names the toggle when it hides rows", () => {
@@ -131,4 +137,18 @@ test("a fold names how many rows it hides, in the toggle hint", () => {
 	const thinking = renderThreadItem({ kind: "thinking", text: "a\n\nb\n\nc\n\nd" }, plainTheme, 70, { expanded: false, hint: "ctrl+o to expand" });
 	assert.equal(thinking[0], "Thinking · +4 rows · ctrl+o to expand");
 	fits(folded, 70);
+});
+
+test("a folded preview truncates long output lines instead of wrapping them, and counts what expanding adds", () => {
+	const tool = { kind: "tool" as const, callId: "call", name: "grep", args: { pattern: "x" }, output: "src/lib/module-0.ts:10: match found here\nshort\nthird", running: false, isError: false };
+	const folded = renderThreadItem(tool, plainTheme, 44, { expanded: false, hint: "ctrl+o to expand" });
+	const rows = folded.filter((line) => line.startsWith("│"));
+	assert.equal(rows.length, 3, "one row per source line, none spent on a wrapped tail");
+	assert.equal(rows[0].includes("…"), true, `the long row is cut with an ellipsis: "${rows[0]}"`);
+	assert.equal(folded.some((line) => line.includes("here")), false, "the cut tail is not shown folded");
+	assert.equal(folded[0].includes("+1 row · ctrl+o to expand"), true, `expanding reveals the wrapped tail, so the border says so: "${folded[0]}"`);
+	const unfolded = renderThreadItem(tool, plainTheme, 44, { expanded: true, hint: "ctrl+o to collapse" });
+	assert.equal(unfolded.some((line) => line.includes("here")), true, "expanded keeps every character, wrapped");
+	fits(folded, 44);
+	fits(unfolded, 44);
 });
