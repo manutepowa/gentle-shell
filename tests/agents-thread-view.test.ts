@@ -118,3 +118,17 @@ test("thinking folds to three rows by default and names the toggle when it hides
 	assert.deepEqual(renderThreadItem(item, taggedTheme, 30, { expanded: true, hint: "ctrl+o to collapse" }),
 		["[customMessageLabel]Thinking", "  [dim]one", "  [dim]two", "  [dim]three", "  [dim]four", "  [dim]five", ""]);
 });
+
+test("a fold names how many rows it hides, in the toggle hint", () => {
+	const output = Array.from({ length: 8 }, (_, index) => `row ${index}`).join("\n");
+	const tool = { kind: "tool" as const, callId: "call", name: "bash", args: { command: "ls" }, output, running: false, isError: false };
+	const folded = renderThreadItem(tool, plainTheme, 70, { expanded: false, hint: "ctrl+o to expand" });
+	assert.equal(folded[0].includes("+5 rows · ctrl+o to expand"), true, `the border counts the hidden rows: "${folded[0]}"`);
+	const short = renderThreadItem({ ...tool, output: "a\nb" }, plainTheme, 70, { expanded: false, hint: "ctrl+o to expand" });
+	assert.equal(short[0].includes("rows"), false, `a fold that hides nothing names no count: "${short[0]}"`);
+	const unfolded = renderThreadItem(tool, plainTheme, 70, { expanded: true, hint: "ctrl+o to collapse" });
+	assert.equal(unfolded[0].includes("rows"), false, `an expanded card hides nothing: "${unfolded[0]}"`);
+	const thinking = renderThreadItem({ kind: "thinking", text: "a\n\nb\n\nc\n\nd" }, plainTheme, 70, { expanded: false, hint: "ctrl+o to expand" });
+	assert.equal(thinking[0], "Thinking · +4 rows · ctrl+o to expand");
+	fits(folded, 70);
+});

@@ -24,6 +24,13 @@ const PROSE = {
 } as const;
 
 const OUTPUT_INDENT = 2;
+const PREVIEW_ROWS = 3;
+
+/** The toggle hint, led by how many rows the fold hides so a reader knows what expanding buys. */
+function foldHint(hint: string | undefined, hidden: number): string | undefined {
+	if (hint === undefined || hidden <= 0) return hint;
+	return `+${hidden} ${hidden === 1 ? "row" : "rows"} · ${hint}`;
+}
 
 // Pi's own transcript paints Markdown with these theme tokens.
 const MD_TOKEN = {
@@ -160,17 +167,17 @@ function outputRows(item: ToolItem, cardWidth: number): string[] {
 
 function toolLines(item: ToolItem, theme: AgentsThreadTheme, width: number, options: ThreadRenderOptions): string[] {
 	const state = toolState(item);
-	// A call with nothing to show has nothing to fold, so it never advertises the toggle.
-	const hint = item.output.length === 0 ? undefined : options.hint;
 	return floatRows(state.tone, theme, width, (cardWidth) => {
 		const title = singleLine(item.name) || "tool";
 		const summary = argSummary(item.args);
 		const room = Math.max(8, cardWidth - visibleWidth(title) - 16);
 		const subtitle = summary.length === 0 ? undefined : truncateToWidth(summary, room, "…");
 		const body = outputRows(item, cardWidth);
+		// A call with nothing to show has nothing to fold, so it never advertises the toggle.
+		const hint = body.length === 0 ? undefined : foldHint(options.hint, options.expanded === true ? 0 : body.length - PREVIEW_ROWS);
 		return {
 			head: [cardTop({ title, subtitle, body: [], tone: state.tone, glyph: state.glyph }, theme, cardWidth, hint)],
-			...(body.length > 0 ? { body: cardBodyRows(body, state.tone, theme, cardWidth, { expanded: options.expanded === true, previewRows: 3 }) } : {}),
+			...(body.length > 0 ? { body: cardBodyRows(body, state.tone, theme, cardWidth, { expanded: options.expanded === true, previewRows: PREVIEW_ROWS }) } : {}),
 			bottom: cardBottom(state.tone, theme, cardWidth, state.status),
 		};
 	});
@@ -178,15 +185,16 @@ function toolLines(item: ToolItem, theme: AgentsThreadTheme, width: number, opti
 
 // Thinking folds like tool output: the preview keeps the first rows, and the
 // label names the toggle only when the fold actually hides some.
-const THINKING_PREVIEW_ROWS = 3;
-
 function thinkingLines(text: string, theme: AgentsThreadTheme, width: number, options: ThreadRenderOptions): string[] {
 	const indent = " ".repeat(OUTPUT_INDENT);
 	const body = markdownLines(theme, text, width - OUTPUT_INDENT, PROSE.THINKING, true)
 		.map((row) => `${indent}${row}`.replace(/[ \t]+$/u, ""));
-	const folded = options.expanded !== true && body.length > THINKING_PREVIEW_ROWS;
-	const label = folded && options.hint ? truncateToWidth(`Thinking · ${options.hint}`, width) : "Thinking";
-	return [paint(theme, PROSE.LABEL)(label), ...(folded ? body.slice(0, THINKING_PREVIEW_ROWS) : body)];
+	const folded = options.expanded !== true && body.length > PREVIEW_ROWS;
+	const named = (hint: string | undefined) => (hint ? `Thinking · ${hint}` : "Thinking");
+	// The count goes first when space is short: the key name matters more than the tally.
+	const counted = named(folded ? foldHint(options.hint, body.length - PREVIEW_ROWS) : undefined);
+	const label = visibleWidth(counted) <= width ? counted : truncateToWidth(named(folded ? options.hint : undefined), width);
+	return [paint(theme, PROSE.LABEL)(label), ...(folded ? body.slice(0, PREVIEW_ROWS) : body)];
 }
 
 // A note is a notice, unless the child reported a failure: then it wears the
