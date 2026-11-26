@@ -2876,6 +2876,84 @@ test("vim NORMAL rejects encoded insertions and paste without losing Unicode mul
 	editor.dispose();
 });
 
+function vimKjPrompt(policy: "on" | "off" = "on") {
+	let now = 0;
+	const editor = new GentlePromptEditor(fakeTui as never, editorTheme as never, fakeKeybindings as never, {
+		fg: (_color, text) => text, bold: (text) => text, requestRender() {}, pending: () => false,
+		now: () => now, doubleEscCancelEnabled: () => false, dispatchQueuedText() {},
+	});
+	editor.setVimPolicy(policy);
+	return { editor, type(key: string, elapsed = 0) { now += elapsed; editor.handleInput(key); } };
+}
+
+test("vim kj at 299 ms removes only the typed k and enters NORMAL", (t) => {
+	const { editor, type } = vimKjPrompt();
+	t.after(() => editor.dispose());
+	editor.setText("keep");
+	type("\x1b");
+	type("0");
+	type("i");
+	type("k");
+	assert.equal(editor.getText(), "kkeep");
+	type("j", 299);
+	assert.equal(editor.getText(), "keep");
+	assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
+	assert.match(editor.render(40).join("\n"), /NORMAL/);
+	type("x");
+	assert.equal(editor.getText(), "eep");
+});
+
+for (const exit of ["kj", "Escape"]) {
+	test(`vim ${exit} ends the insert session for dot-repeat and undo`, (t) => {
+		const { editor, type } = vimKjPrompt();
+		t.after(() => editor.dispose());
+		editor.setText("tail");
+		for (const key of ["\x1b", "0", "i", "z"]) type(key);
+		if (exit === "kj") { type("k"); type("j", 299); }
+		else type("\x1b");
+		assert.equal(editor.getText(), "ztail");
+		type(".");
+		assert.equal(editor.getText(), "zztail");
+		type("u");
+		assert.equal(editor.getText(), "ztail");
+		type("u");
+		assert.equal(editor.getText(), "tail");
+	});
+}
+
+for (const [name, keys, elapsed] of [
+	["kj at 300 ms", "kj", 300],
+	["kj after 300 ms", "kj", 301],
+	["k and j separated by another key", "kaj", 1],
+	["j alone", "j", 0],
+	["jk in reverse order", "jk", 1],
+	["kj with Vim off", "kj", 1],
+] as const) {
+	test(`vim ${name} uses ordinary typing`, (t) => {
+		const policy = name === "kj with Vim off" ? "off" : "on";
+		const { editor, type } = vimKjPrompt(policy);
+		t.after(() => editor.dispose());
+		for (const key of keys) type(key, elapsed);
+		assert.equal(editor.getText(), keys);
+		if (policy === "on") assert.match(editor.render(40).join("\n"), /INSERT/);
+		type("x");
+		assert.equal(editor.getText(), `${keys}x`);
+	});
+}
+
+test("vim kj uses ordinary typing while autocomplete is visible", (t) => {
+	const { editor, type } = vimKjPrompt();
+	t.after(() => editor.dispose());
+	const internal = editor as unknown as { autocompleteState: string; autocompleteList: { render(width: number): string[] } };
+	internal.autocompleteState = "force";
+	internal.autocompleteList = { render: () => ["completion"] };
+	type("k");
+	type("j", 1);
+	assert.equal(editor.getText(), "kj");
+	assert.match(editor.render(40).join("\n"), /INSERT/);
+	assert.equal(editor.isShowingAutocomplete(), true);
+});
+
 test("vim NORMAL hands autocomplete and bash-mode input to Pi only after entering INSERT", () => {
 	const editor = new GentlePromptEditor(fakeTui as never, editorTheme as never, fakeKeybindings as never, {
 		fg: (_color, text) => text, bold: (text) => text, requestRender() {}, pending: () => false,

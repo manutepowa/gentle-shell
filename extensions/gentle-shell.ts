@@ -561,6 +561,7 @@ const PROMPT_FRAME_ROLE = "border";
 // Matches Pi's own idle double-Esc window (empty editor -> /tree or /fork);
 // this is the same muscle memory applied to clearing a non-empty draft.
 const IDLE_ESC_CLEAR_WINDOW_MS = 500;
+const VIM_KJ_WINDOW_MS = 300;
 const BRACKETED_PASTE_START = "\x1b[200~";
 const BRACKETED_PASTE_END = "\x1b[201~";
 // Bound our framing buffer even when a terminal never sends the closing marker.
@@ -601,6 +602,7 @@ export class GentlePromptEditor extends CustomEditor {
 	private readonly vimEngine = new VimNormalEngine();
 	private readonly vimOperator = new VimOperatorEngine();
 	private vimInsertIntent?: { operator?: OperatorResult; command?: string };
+	private vimKjCandidate?: { at: number; text: string; line: number; col: number };
 	private readonly vimVisual = new VimVisualEngine();
 	private pasteFrame: string | undefined;
 	private pasteOverflow = false;
@@ -771,6 +773,7 @@ export class GentlePromptEditor extends CustomEditor {
 			}
 		}
 		if (this.vimPolicy === policy) return;
+		this.vimKjCandidate = undefined;
 		this.pasteFrame = undefined;
 		this.pasteOverflow = false;
 		this.pasteTail = "";
@@ -823,6 +826,7 @@ export class GentlePromptEditor extends CustomEditor {
 	}
 
 	private enterVimInsert(resetEngine = true, cancelOperator = true, beginSession = true): void {
+		this.vimKjCandidate = undefined;
 		if (this.vimNormal && beginSession) {
 			try { this.vimAdapter().beginInsertSession(); } catch { /* Unknown layout: normal edits remain disabled. */ }
 		}
@@ -895,9 +899,28 @@ export class GentlePromptEditor extends CustomEditor {
 		else this.selectionEngine.handleInput(data, (d) => this.handleInputNative(d), (d) => this.onExtensionShortcut?.(d) === true);
 	}
 
+	private consumeKjSequence(data: string): boolean {
+		const candidate = this.vimKjCandidate;
+		this.vimKjCandidate = undefined;
+		if (!candidate || this.vimPolicy !== "on" || this.vimNormal ||
+			this.isShowingAutocomplete() || !matchesKey(data, "j")) return false;
+		const elapsed = this.deps.now() - candidate.at;
+		if (!(elapsed >= 0 && elapsed < VIM_KJ_WINDOW_MS)) return false;
+		const cursor = this.getCursor();
+		if (cursor.line !== candidate.line || cursor.col !== candidate.col || this.getText() !== candidate.text) return false;
+		try {
+			this.vimAdapter().replace({ line: cursor.line, col: cursor.col - 1 }, cursor, "");
+			return true;
+		} catch {
+			// An unsafe range or unsupported editor must keep ordinary typing.
+			return false;
+		}
+	}
+
 	private handleInputNative(data: string): void {
 		if ((this.vimPolicy === "on" || this.vimRejected) && this.handleVimPasteFrame(data)) return;
 		if (this.vimPolicy === "on" && isKeyRelease(data)) return;
+		const kjEscape = this.consumeKjSequence(data);
 		if (this.vimPolicy === "on" && this.vimNormal && matchesKey(data, "escape") && this.vimVisual.active) {
 			if (this.isShowingAutocomplete()) {
 				try { this.vimAdapter().dismissAutocomplete(); } catch { return; }
@@ -920,13 +943,14 @@ export class GentlePromptEditor extends CustomEditor {
 			(bashMode && !this.keybindingsManager.matches(data, "app.interrupt") && !matchesKey(data, "escape")))) {
 			this.enterVimInsert();
 		}
+		const insertEscape = kjEscape || matchesKey(data, "escape");
 		if (this.vimPolicy === "on" && !this.vimNormal && !this.isShowingAutocomplete() &&
-			(this.keybindingsManager.matches(data, "app.interrupt") || matchesKey(data, "escape"))) {
+			(insertEscape || this.keybindingsManager.matches(data, "app.interrupt"))) {
 			try {
 				const inserted = this.vimAdapter().endInsertSession();
-				if (matchesKey(data, "escape") && inserted && this.vimInsertIntent?.operator)
+				if (insertEscape && inserted && this.vimInsertIntent?.operator)
 					this.vimOperator.rememberInsert(this.vimInsertIntent.operator, inserted);
-				else if (matchesKey(data, "escape") && inserted && this.vimInsertIntent?.command)
+				else if (insertEscape && inserted && this.vimInsertIntent?.command)
 					this.vimOperator.rememberLiteralInsert(this.vimInsertIntent.command, inserted);
 			} catch { /* Unknown layout: no grouping or repeat. */ }
 			this.vimInsertIntent = undefined;
@@ -1265,6 +1289,21 @@ export class GentlePromptEditor extends CustomEditor {
 				return;
 			}
 		}
+		if (this.vimPolicy === "on" && !this.vimNormal && !this.isShowingAutocomplete() && matchesKey(data, "k")) {
+			const at = this.deps.now();
+			const { line, col } = this.getCursor();
+			const lines = this.getText().split("\n");
+			const original = lines[line]!;
+			lines[line] = original.slice(0, col) + "k" + original.slice(col);
+			super.handleInput(data);
+			const cursor = this.getCursor();
+			const text = lines.join("\n");
+			if (this.vimPolicy === "on" && !this.vimNormal && !this.isShowingAutocomplete() &&
+				cursor.line === line && cursor.col === col + 1 && this.getText() === text) {
+				this.vimKjCandidate = { at, text, line, col: cursor.col };
+			}
+			return;
+		}
 		super.handleInput(data);
 	}
 
@@ -1283,6 +1322,7 @@ export class GentlePromptEditor extends CustomEditor {
 			this.pasteOverflow = false;
 			data = data.slice(start + BRACKETED_PASTE_START.length);
 		}
+		this.vimKjCandidate = undefined;
 		// Retain only the terminator's possible prefix between events. This
 		// avoids rescanning the entire paste for each single-character chunk.
 		const chunk = this.pasteTail + data;
