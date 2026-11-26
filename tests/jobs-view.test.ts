@@ -412,3 +412,58 @@ test("real centered TuiAltScreen SGR events hover, select and stop the visible j
 		assert.deepEqual(h.stopped, ["second"]);
 	} finally { tui.stop(); h.view.dispose(); }
 });
+
+const detailColumn = (lines: string[]) => lines.slice(1, -2).map((line) => (line.split("│")[2] ?? "").replace(/^ /, "").trimEnd());
+const longCommand = Array.from({ length: 40 }, (_, index) => `--flag-${index}=value${index}`).join(" ");
+
+test("the selected job's command wraps to the detail pane's width instead of being cut", () => {
+	const h = harness([job({ id: "build", command: longCommand })], 30);
+	const detail = detailColumn(h.screen(100));
+	const start = detail.findIndex((line) => line.startsWith("Command "));
+	const end = detail.findIndex((line) => line.startsWith("Status "));
+	assert.ok(start >= 0 && end > start + 1, detail.join("\n"));
+	const wrapped = detail.slice(start, end);
+	assert.ok(wrapped.every((line) => !line.includes("…")), wrapped.join("\n"));
+	assert.equal(wrapped.map((line, index) => index === 0 ? line.slice("Command ".length) : line.trim()).join(" "), longCommand);
+});
+
+test("Ctrl+J pages the details down and Ctrl+K pages them up when they do not fit", () => {
+	const tail = Array.from({ length: 20 }, (_, index) => `output line ${index}`);
+	const h = harness([job({ id: "build", command: longCommand, tail })], 12);
+	const first = detailColumn(h.screen(100));
+	assert.ok(first.some((line) => line.startsWith("build · build")), first.join("\n"));
+	for (const ctrlJ of ["\n", "\x1b[106;5u"]) {
+		const before = h.renders();
+		h.interaction.handleInput(ctrlJ);
+		assert.equal(h.renders(), before + 1);
+	}
+	const paged = detailColumn(h.screen(100));
+	assert.ok(!paged.some((line) => line.startsWith("build · build")), paged.join("\n"));
+	assert.ok(paged.some((line) => line.startsWith("output line")), paged.join("\n"));
+	for (let page = 0; page < 10; page += 1) h.interaction.handleInput("\n");
+	assert.ok(detailColumn(h.screen(100)).some((line) => line === "output line 19"));
+	h.interaction.handleInput("\x0b");
+	h.interaction.handleInput("\x1b[107;5u");
+	for (let page = 0; page < 10; page += 1) h.interaction.handleInput("\x0b");
+	assert.deepEqual(detailColumn(h.screen(100)), first);
+});
+
+test("Ctrl+K and Ctrl+J leave details that fit unchanged, and Enter still toggles the details", () => {
+	const h = harness([job({ id: "build", tail: ["done"] })], 14);
+	const first = h.screen(100);
+	h.interaction.handleInput("\x0b");
+	assert.deepEqual(h.screen(100), first);
+	const narrow = harness([job({ id: "build", tail: ["done"] })], 14);
+	const list = narrow.screen(50);
+	narrow.interaction.handleInput("\n");
+	assert.notDeepEqual(narrow.screen(50), list);
+});
+
+test("a new selection starts its details at the first page", () => {
+	const tail = Array.from({ length: 20 }, (_, index) => `output line ${index}`);
+	const h = harness([job({ id: "a", command: longCommand, tail, startedAt: 2 }), job({ id: "b", command: longCommand, tail, startedAt: 1 })], 12);
+	h.screen(100);
+	h.interaction.handleInput("\n");
+	h.interaction.handleInput("j");
+	assert.ok(detailColumn(h.screen(100)).some((line) => line.startsWith("b · b")));
+});

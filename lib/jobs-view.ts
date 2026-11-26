@@ -3,7 +3,7 @@
 // Agents overlay geometry and roles so both read as one family, but stays a
 // small standalone view: jobs have no peers, groups, or threads.
 
-import { Key, matchesKey, truncateToWidth, visibleWidth, type Component, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
+import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import type { JobRecord } from "./background-jobs.ts";
 import { formatJobDuration, JOB_GLYPH, jobOutcome } from "./background-jobs-tools.ts";
 import { measureAgentsViewLayout, type AgentsViewMode } from "./agents-view-layout.ts";
@@ -79,6 +79,10 @@ export class JobsView {
 	private selectedId: string | undefined;
 	private details = false;
 	private listScroll = 0;
+	/** First detail line shown; only moves while the details are taller than the pane. */
+	private detailScroll = 0;
+	private detailFor: string | undefined;
+	private detailSize: { lines: number; rows: number } | undefined;
 	private closed = false;
 	private readonly timer: ReturnType<typeof setInterval>;
 	private readonly pointerScope = createNativePointerScope();
@@ -136,7 +140,10 @@ export class JobsView {
 		if (this.closed) return;
 		const jobs = this.orderedJobs();
 		const index = Math.max(0, jobs.findIndex((job) => job.id === this.selected(jobs)?.id));
+		const pageDown = matchesKey(data, Key.ctrl("j"));
 		if (data === "q") this.close();
+		// Ctrl+J is also a bare LF, which some terminals send for Enter: it pages only details that do not fit.
+		else if ((pageDown || matchesKey(data, Key.ctrl("k"))) && this.detailOverflows()) this.pageDetails(pageDown ? 1 : -1);
 		else if (matchesKey(data, Key.escape)) {
 			if (this.details) this.details = false;
 			else this.close();
@@ -169,6 +176,9 @@ export class JobsView {
 		const rowIds = layout.mode === "panes" || !this.details ? jobs.slice(this.listScroll, this.listScroll + layout.bodyRows).map((job) => job.id) : [];
 		const targets: PointerTarget[] = rowIds.map((id, row) => ({ kind: TARGET.JOB, key: JSON.stringify([TARGET.JOB, id]), id, x: layout.listX, y: row + 1, width: layout.listWidth }));
 		const inner = layout.width - 2;
+		const detailShown = layout.mode === "panes" || this.details;
+		const detail = selected ? this.detailLines(selected, layout.bodyRows, layout.mode === "panes" ? layout.threadWidth : layout.listWidth, detailShown) : [theme.fg(ROLE.EMPTY, "No background jobs in this session."), theme.fg(ROLE.EMPTY, "The agent starts them with bash_background or monitor.")];
+		if (!selected || !detailShown) this.detailSize = undefined;
 		const keys = this.fittingKeys(selected, layout.mode === "narrow", inner - 2);
 		let offset = 0;
 		for (const [key, label] of keys.entries) {
@@ -182,7 +192,6 @@ export class JobsView {
 		const title = truncateToWidth(`${JOB_GLYPH} Jobs · ${running} running · ${jobs.length - running} finished`, Math.max(0, inner - 4), "…");
 		const top = theme.fg(ROLE.FRAME, "╭─ ") + theme.fg(ROLE.TITLE, title) + theme.fg(ROLE.FRAME, ` ${rule(inner - visibleWidth(title) - 3)}╮`);
 		const list = this.listLines(jobs, selected, layout.listWidth, layout.bodyRows);
-		const detail = selected ? this.detailLines(selected, layout.bodyRows) : [theme.fg(ROLE.EMPTY, "No background jobs in this session."), theme.fg(ROLE.EMPTY, "The agent starts them with bash_background or monitor.")];
 		const bar = theme.fg(ROLE.FRAME, "│");
 		const body: string[] = [];
 		for (let row = 0; row < layout.bodyRows; row += 1) {
@@ -236,23 +245,50 @@ export class JobsView {
 		});
 	}
 
-	private detailLines(job: JobRecord, rows: number): string[] {
+	private detailOverflows(): boolean {
+		return !!this.detailSize && this.detailSize.lines > this.detailSize.rows;
+	}
+
+	private pageDetails(direction: 1 | -1): void {
+		const size = this.detailSize!;
+		this.detailScroll = Math.max(0, Math.min(size.lines - size.rows, this.detailScroll + direction * size.rows));
+	}
+
+	/** The command wrapped under its label, so no part of it is cut at the pane's edge. */
+	private commandLines(command: string, width: number): string[] {
+		const label = "Command ";
+		const room = Math.max(1, width - label.length);
+		return wrapTextWithAnsi(clean(command), room).map((line, index) =>
+			index === 0 ? `${this.deps.theme.fg(ROLE.META, "Command")} ${line}` : `${" ".repeat(label.length)}${line}`);
+	}
+
+	private detailLines(job: JobRecord, rows: number, width: number, shown: boolean): string[] {
 		const { theme } = this.deps;
+		if (this.detailFor !== job.id || !shown) {
+			this.detailFor = job.id;
+			this.detailScroll = 0;
+		}
 		const head = [
 			theme.fg(ROLE.TITLE, `${clean(job.label)} · ${job.id}`),
-			`${theme.fg(ROLE.META, "Command")} ${clean(job.command)}`,
+			...this.commandLines(job.command, width),
 			`${theme.fg(ROLE.META, "Status ")} ${clean(jobOutcome(job))} · ${this.elapsed(job)}${job.kind === "monitor" ? ` · ${job.events ?? 0} event${job.events === 1 ? "" : "s"}` : ""}`,
 			`${theme.fg(ROLE.META, "Output ")} ${clean(job.outputPath)}`,
 			"",
 		];
+		// Details that fit keep the latest output that has room; taller ones keep all of it and page.
+		const fits = head.length + 1 <= rows;
 		const room = Math.max(0, rows - head.length - 1);
-		const tail = job.tail.slice(-room).map((line) => sanitizeTerminalText(line));
-		return [...head, theme.fg(ROLE.META, tail.length > 0 ? "Last output" : "No output yet."), ...tail];
+		const tail = (fits ? job.tail.slice(-room) : job.tail).map((line) => sanitizeTerminalText(line));
+		const lines = [...head, theme.fg(ROLE.META, tail.length > 0 ? "Last output" : "No output yet."), ...tail];
+		if (shown) this.detailSize = { lines: lines.length, rows };
+		this.detailScroll = Math.max(0, Math.min(this.detailScroll, lines.length - rows));
+		return lines.slice(this.detailScroll);
 	}
 
 	private keys(selected: JobRecord | undefined, narrow: boolean): Array<[string, string]> {
 		const keys: Array<[string, string]> = [["↑↓", "move"]];
 		if (narrow && selected) keys.push(["tab", this.details ? "list" : "details"]);
+		if (this.detailOverflows()) keys.push(["^J/^K", "page"]);
 		if (selected?.status === "running") keys.push(["s", "Stop"]);
 		keys.push(["q", "close"]);
 		return keys;
