@@ -68,7 +68,7 @@ function isolatedEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
 	isolatedConfigHomes.push(home);
 	return { ...env, GENTLE_PI_CONFIG_HOME: home };
 }
-const gentleShell: typeof installGentleShell = (pi, env, deps) => installGentleShell(pi, isolatedEnv(env), { resolveWorktree, gitRunner: (cwd) => async (args) => pi.exec("git", ["-C", cwd, ...args], { timeout: 5000 }), rootExists: () => true, ...deps });
+const gentleShell: typeof installGentleShell = (pi, env, deps) => installGentleShell(pi, isolatedEnv(env), { resolveWorktree, gitRunner: (cwd) => async (args) => pi.exec("git", ["-C", cwd, ...args], { timeout: 5000 }), rootExists: () => true, readClipboardText: undefined, writeClipboardText: undefined, ...deps });
 
 const plainTheme = {
 	fg(_color: string, value: string) {
@@ -3086,6 +3086,120 @@ test("vim operator survives an unhandled extension shortcut probe", () => {
 		editor.handleInput("w");
 		assert.equal(editor.getText(), "def");
 		assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
+	} finally { editor.dispose(); }
+});
+
+function clipboardVimEditor(deps: Partial<ConstructorParameters<typeof GentlePromptEditor>[3]>) {
+	const editor = new GentlePromptEditor(fakeTui as never, editorTheme as never, fakeKeybindings as never, {
+		fg: (_color, text) => text, bold: (text) => text, requestRender() {}, pending: () => false,
+		now: () => 0, doubleEscCancelEnabled: () => false, dispatchQueuedText() {}, ...deps,
+	});
+	editor.setVimPolicy("on");
+	editor.setText("one\ntwo words");
+	editor.handleInput("\x1b");
+	createVimEditorAdapter(editor, INSTALLED_PI).move({ line: 1, col: 0 });
+	return editor;
+}
+
+const flushClipboard = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+for (const [keys, copied, draft] of [
+	["yy", "two words\n", "one\ntwo words"], ["dd", "two words\n", "one"], ["cc", "two words\n", "one\n"],
+	["yw", "two ", "one\ntwo words"], ["dw", "two ", "one\nwords"], ["x", "t", "one\nwo words"],
+	["vly", "tw", "one\ntwo words"], ["vld", "tw", "one\no words"], ["vlc", "tw", "one\no words"],
+] as const) {
+	test(`Vim clipboard writes ${keys} exactly once`, () => {
+		const writes: string[] = [];
+		const editor = clipboardVimEditor({ writeClipboardText: async (text) => { writes.push(text); } });
+		try {
+			for (const key of keys) editor.handleInput(key);
+			assert.deepEqual(writes, [copied]);
+			assert.equal(editor.getText(), draft);
+		} finally { editor.dispose(); }
+	});
+}
+
+test("Vim clipboard yy then p keeps the line linewise when the clipboard echoes the yank", async () => {
+	let clipboard: string | null = null;
+	const editor = clipboardVimEditor({ writeClipboardText: async (text) => { clipboard = text; }, readClipboardText: async () => clipboard });
+	try {
+		createVimEditorAdapter(editor, INSTALLED_PI).move({ line: 0, col: 0 });
+		for (const key of "yyp") editor.handleInput(key);
+		await flushClipboard();
+		assert.equal(editor.getText(), "one\none\ntwo words");
+		assert.deepEqual(editor.getCursor(), { line: 1, col: 0 });
+	} finally { editor.dispose(); }
+});
+
+test("Vim clipboard writer rejection leaves the editor and internal register usable", async () => {
+	const writes: string[] = [];
+	const editor = clipboardVimEditor({ writeClipboardText: async (text) => { writes.push(text); throw new Error("unavailable"); } });
+	try {
+		const before = editor.getCursor();
+		for (const key of "yw") editor.handleInput(key);
+		await flushClipboard();
+		assert.deepEqual(writes, ["two "]);
+		assert.equal(editor.getText(), "one\ntwo words");
+		assert.deepEqual(editor.getCursor(), before);
+		assert.match(editor.render(40).join("\n"), /NORMAL/);
+		editor.handleInput("P");
+		assert.equal(editor.getText(), "one\ntwo two words");
+	} finally { editor.dispose(); }
+});
+
+for (const [keys, expected] of [["p", "one\ntA\nBwo words"], ["P", "one\nA\nBtwo words"], ["vlp", "one\nA\nBo words"]] as const) {
+	test(`Vim clipboard ${keys} uses clipboard before register and normalizes CRLF`, async () => {
+		let reads = 0;
+		const writes: string[] = [];
+		const editor = clipboardVimEditor({ readClipboardText: async () => { reads++; return "A\r\nB"; }, writeClipboardText: async (text) => { writes.push(text); } });
+		try {
+			for (const key of "yw" + keys) editor.handleInput(key);
+			assert.equal(editor.getText(), "one\ntwo words", "paste waits without editing the draft");
+			await flushClipboard();
+			assert.equal(editor.getText(), expected);
+			assert.equal(reads, 1);
+			assert.deepEqual(writes, keys === "vlp" ? ["two ", "tw"] : ["two "]);
+			if (keys === "P") {
+				editor.handleInput(".");
+				assert.equal(editor.getText(), "one\nA\nBA\nBtwo words");
+				assert.equal(reads, 1, "dot uses the previous paste payload");
+			}
+		} finally { editor.dispose(); }
+	});
+}
+
+for (const [failure, read] of [
+	["null", async () => null], ["rejection", async () => { throw new Error("unavailable"); }],
+	["timeout", () => new Promise<string | null>(() => {})],
+] as const) {
+	for (const [keys, expected] of [["p", "one\nttwo wo words"], ["P", "one\ntwo two words"], ["vlp", "one\ntwo o words"]] as const) {
+		test(`Vim clipboard ${keys} falls back on ${failure}`, async () => {
+			let reads = 0;
+			const editor = clipboardVimEditor({ readClipboardText: () => { reads++; return read(); } });
+			try {
+				for (const key of "yw" + keys) editor.handleInput(key);
+				assert.equal(editor.getText(), "one\ntwo words");
+				if (failure === "timeout") await new Promise<void>((resolve) => setTimeout(resolve, 1600));
+				else await flushClipboard();
+				assert.equal(reads, 1);
+				assert.equal(editor.getText(), expected);
+			} finally { editor.dispose(); }
+		});
+	}
+}
+
+test("Vim clipboard drops a pending paste after a newer key", async () => {
+	let finish!: (text: string) => void;
+	const pending = new Promise<string>((resolve) => { finish = resolve; });
+	let reads = 0;
+	const editor = clipboardVimEditor({ readClipboardText: () => { reads++; return pending; } });
+	try {
+		for (const key of "ywPl") editor.handleInput(key);
+		assert.equal(reads, 1);
+		finish("stale");
+		await flushClipboard();
+		assert.equal(editor.getText(), "one\ntwo words");
+		assert.deepEqual(editor.getCursor(), { line: 1, col: 1 });
 	} finally { editor.dispose(); }
 });
 
