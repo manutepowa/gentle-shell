@@ -3,6 +3,7 @@ import { CustomEditor, keyHint, type ExtensionAPI, type ExtensionContext, type K
 import { isHomeOrBroadUserDirectory } from "../lib/bounded-writer-admission.ts";
 import { Editor, Image, Key, decodeKittyPrintable, getCapabilities, isKeyRelease, matchesKey, parseKey, truncateToWidth, visibleWidth, type Component, type EditorTheme, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { readClipboardImage, type ClipboardImage } from "../lib/clipboard-image.ts";
+import { readClipboardText, readClipboardTextWithTimeout, writeClipboardText } from "../lib/clipboard-text.ts";
 import { readPastedImagePaths } from "../lib/pasted-image-paths.ts";
 import { describeAttachment, ImageAttachments } from "../lib/image-attachments.ts";
 import { defaultCacheRoot, ImageDiskCache } from "../lib/image-disk-cache.ts";
@@ -213,6 +214,8 @@ export interface ShellDeps {
 	vimRuntimeVersion?(): string | undefined;
 	/** Clipboard image source for the prompt's attachment chips; tests inject a fake. */
 	readClipboardImage?(): Promise<ClipboardImage | null>;
+	readClipboardText?(): Promise<string | null>;
+	writeClipboardText?(text: string): Promise<void>;
 }
 
 export type ActiveProfileReader = (() => string | undefined) & {
@@ -303,7 +306,7 @@ function ambientDevBinary(): DevBinaryNotice | undefined {
 	}
 }
 
-const defaultShellDeps: Omit<ShellDeps, "activeProfile" | "gitRunner"> = { fetch: (input, init) => globalThis.fetch(input, init), now: () => Date.now(), devBinary: ambientDevBinary, resolveWorktree: resolveSessionWorktree, rootExists: (root) => existsSync(join(root, ".git")), scheduleChangesIdle, changesLineCache: (directory) => shellUntrackedLines(undefined, undefined, directory) };
+const defaultShellDeps: Omit<ShellDeps, "activeProfile" | "gitRunner"> = { fetch: (input, init) => globalThis.fetch(input, init), now: () => Date.now(), devBinary: ambientDevBinary, resolveWorktree: resolveSessionWorktree, rootExists: (root) => existsSync(join(root, ".git")), scheduleChangesIdle, changesLineCache: (directory) => shellUntrackedLines(undefined, undefined, directory), readClipboardText, writeClipboardText: (text) => writeClipboardText(text) };
 
 interface AssistantUsageEntry {
 	type: string;
@@ -543,6 +546,8 @@ interface PromptEditorDeps {
 	/** Pasted images become atomic `[Image#N]` chips; absent, Pi's paste handler runs unchanged. */
 	attachments?: ImageAttachments;
 	readClipboardImage?: () => Promise<ClipboardImage | null>;
+	readClipboardText?: () => Promise<string | null>;
+	writeClipboardText?: (text: string) => Promise<void>;
 	/** Injectable coarse-animation window; production and tests default to SHELL_PULSE_WATCHDOG_MS. */
 	watchdogMs?: number;
 	/** Read on every render: true while the wide IDE chrome shows, so the editor draws its panel frame. */
@@ -600,7 +605,8 @@ export class GentlePromptEditor extends CustomEditor {
 	private vimNormal = false;
 	private compatibilityNotified = false;
 	private readonly vimEngine = new VimNormalEngine();
-	private readonly vimOperator = new VimOperatorEngine();
+	private readonly vimOperator: VimOperatorEngine;
+	private pendingVimPaste?: object;
 	private vimInsertIntent?: { operator?: OperatorResult; command?: string };
 	private vimKjCandidate?: { at: number; text: string; line: number; col: number };
 	private readonly vimVisual = new VimVisualEngine();
@@ -647,6 +653,9 @@ export class GentlePromptEditor extends CustomEditor {
 		super(tui, theme, keybindings);
 		this.selectionEngine = new SelectionEngine(this);
 		this.deps = deps;
+		this.vimOperator = new VimOperatorEngine({ onRegister: (text) => {
+			if (deps.writeClipboardText) void writeClipboardText(text, deps.writeClipboardText);
+		} });
 		this.pointerTui = tui;
 		this.keybindingsManager = keybindings;
 		const attachments = deps.attachments;
@@ -774,6 +783,7 @@ export class GentlePromptEditor extends CustomEditor {
 		}
 		if (this.vimPolicy === policy) return;
 		this.vimKjCandidate = undefined;
+		this.pendingVimPaste = undefined;
 		this.pasteFrame = undefined;
 		this.pasteOverflow = false;
 		this.pasteTail = "";
@@ -886,6 +896,11 @@ export class GentlePromptEditor extends CustomEditor {
 	 * and never reach this branch.
 	 */
 	override handleInput(data: string): void {
+		if (this.pendingVimPaste && !isKeyRelease(data)) {
+			this.pendingVimPaste = undefined;
+			this.vimOperator.cancel();
+			this.vimEngine.reset();
+		}
 		// Selection and Vim handlers can consume input before the native chain;
 		// any intervening key invalidates an idle Esc confirmation.
 		if (this.pendingIdleClearDeadline !== undefined && !this.keybindingsManager.matches(data, "app.interrupt")) {
@@ -915,6 +930,91 @@ export class GentlePromptEditor extends CustomEditor {
 			// An unsafe range or unsupported editor must keep ordinary typing.
 			return false;
 		}
+	}
+
+	/** Consume the key now and apply the paste only to the same editor state. */
+	private queueVimPaste(apply: (text?: string) => void): boolean {
+		const read = this.deps.readClipboardText;
+		if (!read) return false;
+		const token = this.pendingVimPaste = {};
+		const draft = this.getText();
+		const submitted = this.submittedDrafts;
+		const { line, col } = this.getCursor();
+		const anchor = this.visualAnchor;
+		const visual = this.vimVisual.active ? this.vimVisual.kind : undefined;
+		void readClipboardTextWithTimeout(read).then((text) => {
+			if (this.pendingVimPaste !== token) return;
+			this.pendingVimPaste = undefined;
+			const cursor = this.getCursor();
+			if (this.disposed || this.vimPolicy !== "on" || !this.vimNormal || this.submittedDrafts !== submitted ||
+				this.getText() !== draft || cursor.line !== line || cursor.col !== col ||
+				this.visualAnchor !== anchor || (this.vimVisual.active ? this.vimVisual.kind : undefined) !== visual) {
+				this.vimOperator.cancel();
+				this.vimEngine.reset();
+				return;
+			}
+			apply(text ?? undefined);
+		}).catch(() => this.vimOperator.cancel());
+		return true;
+	}
+
+	private applyVisualOperator(command: string, adapter: ReturnType<typeof createVimEditorAdapter>, clipboardText?: string): void {
+		let range;
+		try { range = this.vimVisual.range(this.getText(), this.getCursor(), adapter.motionBoundaries()); }
+		catch (error) { this.notifyUnsafeVisual("range", error); return; }
+		if (!range) { this.notifyUnsafeVisual("range"); return; }
+		let stage: "readRange" | "operation" | "beginInsertSession" | "replace" | "move" = "readRange";
+		let beganInsert = false;
+		try {
+			const selected = adapter.readRange(range.start, range.end);
+			if (!selected && (!range.linewise || !this.getText())) {
+				this.vimVisual.cancel(); this.visualAnchor = undefined;
+				this.vimEngine.reset(); this.deps.requestRender();
+				return;
+			}
+			stage = "operation";
+			const operation = this.vimOperator.visualEdit(command === "x" ? "d" : command === "s" ? "c" : command, this.getText(), range, clipboardText);
+			if (command === "p" && !operation.edit) {
+				this.deps.notifyCompatibility?.("Vim register is empty; yank text before visual paste.");
+				return;
+			}
+			if (operation.edit) {
+				this.vimOperator.forgetRepeat();
+				if (operation.edit.insert) { stage = "beginInsertSession"; adapter.beginInsertSession(); beganInsert = true; }
+				if (operation.edit.start.line !== operation.edit.end.line || operation.edit.start.col !== operation.edit.end.col || operation.edit.text) {
+					stage = "replace"; adapter.replace(operation.edit.start, operation.edit.end, operation.edit.text);
+				}
+				stage = "move"; adapter.move(operation.edit.cursor);
+			}
+			if (["d", "x", "c", "s", "y", "p"].includes(command)) this.vimOperator.visualRegister(range.linewise ? selected + "\n" : selected, range.linewise);
+			this.vimVisual.cancel(); this.visualAnchor = undefined;
+			this.vimOperator.cancel(); this.vimEngine.reset();
+			if (operation.edit?.insert) this.enterVimInsert(true, true, false);
+		} catch (error) {
+			if (beganInsert) { try { adapter.endInsertSession(); } catch { /* Retain the original failure. */ } }
+			this.notifyUnsafeVisual(stage, error);
+		}
+		this.deps.requestRender();
+	}
+
+	private applyNormalOperator(operator: OperatorResult, adapter: ReturnType<typeof createVimEditorAdapter>, wasPending: boolean): void {
+		if (!wasPending) this.vimEngine.reset();
+		if (operator.edit) {
+			try {
+				if (operator.edit.insert) adapter.beginInsertSession();
+				if (operator.edit.text || operator.edit.start.line !== operator.edit.end.line ||
+					operator.edit.start.col !== operator.edit.end.col) {
+					adapter.replace(operator.edit.start, operator.edit.end, operator.edit.text);
+				}
+				adapter.move(operator.edit.cursor);
+				if (operator.edit.insert) {
+					adapter.markInsertAnchor();
+					this.vimInsertIntent = { operator };
+				} else this.vimOperator.remember(operator);
+				if (operator.edit.insert) this.enterVimInsert(true, true, false);
+			} catch { if (operator.edit.insert) adapter.endInsertSession(); this.vimOperator.cancel(); }
+		}
+		this.deps.requestRender();
 	}
 
 	private handleInputNative(data: string): void {
@@ -1124,42 +1224,10 @@ export class GentlePromptEditor extends CustomEditor {
 						this.deps.requestRender(); return;
 					}
 					if (["d", "x", "c", "s", "y", "p", "~", "u", "U", ">", "<", "J"].includes(command)) {
-						let range;
-						try { range = this.vimVisual.range(this.getText(), this.getCursor(), adapter.motionBoundaries()); }
-						catch (error) { this.notifyUnsafeVisual("range", error); return; }
-						if (!range) { this.notifyUnsafeVisual("range"); return; }
-						let stage: "readRange" | "operation" | "beginInsertSession" | "replace" | "move" = "readRange";
-						let beganInsert = false;
-						try {
-							const selected = adapter.readRange(range.start, range.end);
-							if (!selected && (!range.linewise || !this.getText())) {
-								this.vimVisual.cancel(); this.visualAnchor = undefined;
-								this.vimEngine.reset(); this.deps.requestRender();
-								return;
-							}
-							stage = "operation";
-							const operation = this.vimOperator.visualEdit(command === "x" ? "d" : command === "s" ? "c" : command, this.getText(), range);
-							if (command === "p" && !operation.edit) {
-								this.deps.notifyCompatibility?.("Vim register is empty; yank text before visual paste.");
-								return;
-							}
-							if (operation.edit) {
-								this.vimOperator.forgetRepeat();
-								if (operation.edit.insert) { stage = "beginInsertSession"; adapter.beginInsertSession(); beganInsert = true; }
-								if (operation.edit.start.line !== operation.edit.end.line || operation.edit.start.col !== operation.edit.end.col || operation.edit.text) {
-									stage = "replace"; adapter.replace(operation.edit.start, operation.edit.end, operation.edit.text);
-								}
-								stage = "move"; adapter.move(operation.edit.cursor);
-							}
-							if (["d", "x", "c", "s", "y", "p"].includes(command)) this.vimOperator.visualRegister(range.linewise ? selected + "\n" : selected, range.linewise);
-							this.vimVisual.cancel(); this.visualAnchor = undefined;
-							this.vimOperator.cancel(); this.vimEngine.reset();
-							if (operation.edit?.insert) this.enterVimInsert(true, true, false);
-						} catch (error) {
-							if (beganInsert) { try { adapter.endInsertSession(); } catch { /* Retain the original failure. */ } }
-							this.notifyUnsafeVisual(stage, error);
+						if (command !== "p" || !this.queueVimPaste((text) => this.applyVisualOperator(command, adapter, text))) {
+							this.applyVisualOperator(command, adapter);
 						}
-						this.deps.requestRender(); return;
+						return;
 					}
 				}
 				if (command === "." && !this.vimVisual.active && !this.vimOperator.isPending) {
@@ -1193,25 +1261,14 @@ export class GentlePromptEditor extends CustomEditor {
 					this.deps.requestRender(); return;
 				}
 				const wasPending = this.vimOperator.isPending;
+				if (!wasPending && !this.vimVisual.active && (command === "p" || command === "P") &&
+					this.queueVimPaste((text) => {
+						const operator = this.vimOperator.input(command, this.getText(), this.getCursor(), adapter.motionBoundaries(), text);
+						if (operator) this.applyNormalOperator(operator, adapter, false);
+					})) return;
 				const operator = this.vimVisual.active ? null : this.vimOperator.input(command, this.getText(), this.getCursor(), adapter.motionBoundaries());
 				if (operator && (wasPending || !/^[0-9]$/.test(command))) {
-					if (!wasPending) this.vimEngine.reset();
-					if (operator.edit) {
-						try {
-							if (operator.edit.insert) adapter.beginInsertSession();
-							if (operator.edit.text || operator.edit.start.line !== operator.edit.end.line ||
-								operator.edit.start.col !== operator.edit.end.col) {
-								adapter.replace(operator.edit.start, operator.edit.end, operator.edit.text);
-							}
-							adapter.move(operator.edit.cursor);
-							if (operator.edit.insert) {
-								adapter.markInsertAnchor();
-								this.vimInsertIntent = { operator };
-							} else this.vimOperator.remember(operator);
-							if (operator.edit.insert) this.enterVimInsert(true, true, false);
-						} catch { if (operator.edit.insert) adapter.endInsertSession(); this.vimOperator.cancel(); }
-					}
-					this.deps.requestRender();
+					this.applyNormalOperator(operator, adapter, wasPending);
 					return;
 				}
 				if (command === "u" && !this.vimVisual.active) { adapter.undo(); this.vimEngine.reset(); this.deps.requestRender(); return; }
@@ -1615,7 +1672,7 @@ type PromptFactory = NonNullable<ReturnType<ExtensionContext["ui"]["getEditorCom
 function installPrompt(
 	ctx: ExtensionContext,
 	onCreated: (prompt: GentlePromptEditor) => void,
-	promptDeps: { now: () => number; doubleEscCancelEnabled: () => boolean; dispatchQueuedText: (text: string) => void; vimRuntimeVersion?: () => string | undefined; attachments?: ImageAttachments; readClipboardImage?: () => Promise<ClipboardImage | null>; panelChrome?: (tui: TUI) => boolean; panelButton?: (tui: TUI) => boolean; topRows?: (tui: TUI, width: number, hovered?: number) => string[]; onTopRowClick?: (tui: TUI, index: number) => void; onPanelClick?: () => void },
+	promptDeps: { now: () => number; doubleEscCancelEnabled: () => boolean; dispatchQueuedText: (text: string) => void; vimRuntimeVersion?: () => string | undefined; attachments?: ImageAttachments; readClipboardImage?: () => Promise<ClipboardImage | null>; readClipboardText?: PromptEditorDeps["readClipboardText"]; writeClipboardText?: PromptEditorDeps["writeClipboardText"]; panelChrome?: (tui: TUI) => boolean; panelButton?: (tui: TUI) => boolean; topRows?: (tui: TUI, width: number, hovered?: number) => string[]; onTopRowClick?: (tui: TUI, index: number) => void; onPanelClick?: () => void },
 ): boolean {
 	const previous = ctx.ui.getEditorComponent() as PromptFactory | undefined;
 	if (previous && !previous[PROMPT_OWNER]) return false;
@@ -1634,6 +1691,8 @@ function installPrompt(
 			workingLabel: () => oddPhaseRegistry.label(ctx.sessionManager.getSessionId()),
 			attachments: promptDeps.attachments,
 			readClipboardImage: promptDeps.readClipboardImage,
+			readClipboardText: promptDeps.readClipboardText,
+			writeClipboardText: promptDeps.writeClipboardText,
 			panelChrome: promptDeps.panelChrome ? () => promptDeps.panelChrome!(tui) : undefined,
 			panelButton: promptDeps.panelButton ? () => promptDeps.panelButton!(tui) : undefined,
 			topRows: promptDeps.topRows ? (width, hovered) => promptDeps.topRows!(tui, width, hovered) : undefined,
@@ -3150,6 +3209,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				prompt.setVimPolicy(vimPolicy);
 			},
 			{ now: () => deps.now(), doubleEscCancelEnabled: () => doubleEscCancelPolicy === "on", dispatchQueuedText: (text) => { pendingQueuedText = pendingQueuedText === undefined ? text : `${pendingQueuedText}\n\n${text}`; }, vimRuntimeVersion: deps.vimRuntimeVersion, attachments: imageAttachments, readClipboardImage: () => (deps.readClipboardImage ?? readClipboardImage)(),
+				readClipboardText: deps.readClipboardText, writeClipboardText: deps.writeClipboardText,
 				// The editor joins the wide IDE chrome while the rail owns the host with the header on top.
 				panelChrome: (tui) => chromeMode(tui) !== undefined || chromeBarsShown(tui, true),
 				// Without the rail, [ Panel ] opens the Status sections: the mobile chrome,

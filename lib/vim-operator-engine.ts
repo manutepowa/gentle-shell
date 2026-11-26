@@ -22,6 +22,23 @@ export class VimOperatorEngine {
   private register: Register | undefined;
   private sequence: string[] = [];
   private lastChange: RepeatChange | undefined;
+  private readonly onRegister?: (text: string, linewise: boolean) => void;
+
+  constructor(options: { onRegister?: (text: string, linewise: boolean) => void } = {}) {
+    this.onRegister = options.onRegister;
+  }
+
+  private commitRegister(text: string, linewise: boolean): void {
+    this.register = { text, linewise };
+    this.onRegister?.(text, linewise);
+  }
+
+  private pasteRegister(clipboardText?: string): Register | undefined {
+    // The system clipboard has no Vim register type. Preserve the local type
+    // when it echoes our register; otherwise treat external text as literal.
+    return clipboardText === undefined || clipboardText === this.register?.text ? this.register :
+      { text: clipboardText, linewise: false };
+  }
 
   /** Only completed, successfully applied NORMAL edits become repeatable. */
   remember(result: OperatorResult): void {
@@ -63,10 +80,10 @@ export class VimOperatorEngine {
 
   // Caller validates registered paste markers before committing this register.
   visualRegister(text: string, linewise: boolean): void {
-    if (text || linewise) this.register = { text, linewise };
+    if (text || linewise) this.commitRegister(text, linewise);
   }
 
-  visualEdit(key: string, text: string, range: VisualRange): OperatorResult {
+  visualEdit(key: string, text: string, range: VisualRange, clipboardText?: string): OperatorResult {
     const lines = text.split("\n");
     const offset = (p: VimPosition) => lines.slice(0, p.line).reduce((n, line) => n + line.length + 1, 0) + p.col;
     if (key === "y" || (!range.linewise && range.start.line === range.end.line && range.start.col === range.end.col)) return { handled: true };
@@ -85,7 +102,7 @@ export class VimOperatorEngine {
       return { handled: true, edit: { start: range.start, end: range.end, text: replacement, cursor: range.start } };
     }
     if (key === "p") {
-      const register = this.register;
+      const register = this.pasteRegister(clipboardText);
       if (!register) return { handled: true };
       const start = range.start;
       let end = range.end;
@@ -133,10 +150,10 @@ export class VimOperatorEngine {
     return pending;
   }
 
-  input(key: string, text: string, cursor: VimPosition, boundaries?: number[][]): OperatorResult | null {
+  input(key: string, text: string, cursor: VimPosition, boundaries?: number[][], clipboardText?: string): OperatorResult | null {
     const prior = this.sequence;
-    const register = this.register && { ...this.register };
-    const result = this.evaluate(key, text, cursor, boundaries);
+    const register = key === "p" || key === "P" ? this.pasteRegister(clipboardText) : undefined;
+    const result = this.evaluate(key, text, cursor, boundaries, register);
     if (result?.edit && (prior.length || !this.isPending)) {
       // A finite command grammar, not a recording of arbitrary terminal input.
       const keys = [...prior, key];
@@ -151,7 +168,7 @@ export class VimOperatorEngine {
     return result;
   }
 
-  private evaluate(key: string, text: string, cursor: VimPosition, boundaries?: number[][]): OperatorResult | null {
+  private evaluate(key: string, text: string, cursor: VimPosition, boundaries?: number[][], pasteRegister?: Register): OperatorResult | null {
     if (!this.pending && !this.find && !this.object && /^[0-9]$/.test(key) && (key !== "0" || !!this.digits)) {
       this.digits += key; return { handled: true };
     }
@@ -196,10 +213,10 @@ export class VimOperatorEngine {
       }
       return true;
     };
-    const edit = (a: number, b: number, replacement: string, linewise = false, insert = false): OperatorResult => {
+    const edit = (a: number, b: number, replacement: string, linewise = false, insert = false, registerText = text.slice(a, b)): OperatorResult => {
       if (!safe(a, b) || (a === b && !replacement && op !== "y")) return { handled: true };
       if (op) {
-        this.register = { text: text.slice(a, b), linewise };
+        this.commitRegister(registerText, linewise);
         if (op === "y") return { handled: true };
       }
       return { handled: true, edit: { start: position(a), end: position(b), text: replacement,
@@ -250,14 +267,13 @@ export class VimOperatorEngine {
         const b = last + 1 < lines.length ? offset({ line: last + 1, col: 0 }) : text.length;
         const lineText = lines.slice(cursor.line, last + 1).join("\n") + "\n";
         if (op === "y") {
-          if (safe(a, b)) this.register = { text: lineText, linewise: true };
+          if (safe(a, b)) this.commitRegister(lineText, true);
           return { handled: true };
         }
         const from = a === 0 || b < text.length ? a : a - 1;
         const result = edit(from, b, op === "c" && b < text.length ? "\n" :
-          op === "c" && from !== a ? "\n" : "", true);
+          op === "c" && from !== a ? "\n" : "", true, false, lineText);
         if (result.edit) {
-          this.register = { text: lineText, linewise: true };
           const remaining = text.slice(0, from) + result.edit.text + text.slice(b);
           result.edit.cursor = { line: Math.min(cursor.line, remaining.split("\n").length - 1), col: 0 };
         }
@@ -344,7 +360,7 @@ export class VimOperatorEngine {
     }
     if (key === "p" || key === "P") {
       this.cancel();
-      const register = this.register;
+      const register = pasteRegister;
       if (!register) return { handled: true };
       const a = register.linewise ? key === "P" ? offset({ line: cursor.line, col: 0 }) :
         cursor.line + 1 < lines.length ? offset({ line: cursor.line + 1, col: 0 }) : text.length :
