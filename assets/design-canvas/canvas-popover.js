@@ -168,6 +168,12 @@ export function init(ctx) {
 	}
 
 	els.cancel.addEventListener("click", closePopover);
+	// Ctrl+Enter (Cmd+Enter on macOS) submits the box like its button: Send in Send now, Save in Collect.
+	els.text.addEventListener("keydown", (event) => {
+		if (event.key !== "Enter" || !(event.ctrlKey || event.metaKey) || event.isComposing) return;
+		event.preventDefault();
+		if (!els.send.disabled) els.form.requestSubmit(els.send);
+	});
 	els.popover.addEventListener("keydown", (event) => {
 		if (event.key === "Escape") {
 			event.preventDefault();

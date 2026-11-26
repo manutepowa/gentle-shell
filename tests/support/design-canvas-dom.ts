@@ -141,6 +141,8 @@ export class FakeElement {
 		}
 		return event;
 	}
+	/** <form>: submits through its submit listeners, like the browser's requestSubmit() (no constraint validation here). */
+	requestSubmit() { this.dispatch("submit"); }
 	focus() { this.doc.activeElement = this; }
 	getBoundingClientRect() { return this.rect; }
 	setPointerCapture(pointerId: number) { this.capturedPointers.push(pointerId); }
