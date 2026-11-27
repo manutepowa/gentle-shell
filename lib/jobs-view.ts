@@ -7,6 +7,7 @@ import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type 
 import type { JobRecord } from "./background-jobs.ts";
 import { formatJobDuration, JOB_GLYPH, jobOutcome } from "./background-jobs-tools.ts";
 import { measureAgentsViewLayout, type AgentsViewMode } from "./agents-view-layout.ts";
+import { highlightJobsCommand } from "./jobs-command-highlight.ts";
 import { createNativePointerScope } from "./native-pointer-region.ts";
 import { paintHoverable } from "./shell-hover.ts";
 import { sanitizeTerminalText } from "./terminal-theme.ts";
@@ -83,6 +84,7 @@ export class JobsView {
 	private detailScroll = 0;
 	private detailFor: string | undefined;
 	private detailSize: { lines: number; rows: number } | undefined;
+	private commandHighlight: { source: string; text: string; wrapped?: { width: number; lines: string[] } } | undefined;
 	private closed = false;
 	private readonly timer: ReturnType<typeof setInterval>;
 	private readonly pointerScope = createNativePointerScope();
@@ -115,6 +117,7 @@ export class JobsView {
 	}
 
 	invalidate(): void {
+		this.commandHighlight = undefined;
 		this.clearPointerLayout();
 	}
 
@@ -258,7 +261,17 @@ export class JobsView {
 	private commandLines(command: string, width: number): string[] {
 		const label = "Command ";
 		const room = Math.max(1, width - label.length);
-		return wrapTextWithAnsi(clean(command), room).map((line, index) =>
+		// The live clock and output tail can change without changing the command.
+		// Keep highlighting independent of pane width; theme changes invalidate it.
+		let highlight = this.commandHighlight;
+		if (highlight?.source !== command) {
+			const text = highlightJobsCommand(clean(command), (word) => this.deps.theme.fg("mdCode", word));
+			highlight = this.commandHighlight = { source: command, text };
+		}
+		if (highlight.wrapped?.width !== room) {
+			highlight.wrapped = { width: room, lines: wrapTextWithAnsi(highlight.text, room) };
+		}
+		return highlight.wrapped.lines.map((line, index) =>
 			index === 0 ? `${this.deps.theme.fg(ROLE.META, "Command")} ${line}` : `${" ".repeat(label.length)}${line}`);
 	}
 

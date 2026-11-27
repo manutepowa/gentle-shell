@@ -427,6 +427,114 @@ test("the selected job's command wraps to the detail pane's width instead of bei
 	assert.equal(wrapped.map((line, index) => index === 0 ? line.slice("Command ".length) : line.trim()).join(" "), longCommand);
 });
 
+function foregrounds(line: string): string[] {
+	let foreground = "";
+	return (line.match(/\x1b\[[0-9;]*m|./gu) ?? []).flatMap((part) => {
+		if (!part.startsWith("\x1b")) return [foreground];
+		if (part.startsWith("\x1b[38;")) foreground = part;
+		else if (part === "\x1b[39m" || part === "\x1b[0m") foreground = "";
+		return [];
+	});
+}
+
+test("Gentle colors only executable words in a Bash command chain", () => {
+	const spans = ["test", " -f package.json && ", "glab", ' mr view 42 "a && git" && ', "git", " clone git && ", "git", " diff --name-only"];
+	const command = spans.join("");
+	const h = harness([job({ id: "branch", command })], 14, gentleTheme);
+	try {
+		const line = h.frame(180).find((row) => stripAnsi(row).includes(`Command ${command}`));
+		assert.ok(line, "the real Jobs frame displays the complete command");
+		const start = stripAnsi(line).indexOf(command);
+		const colors = foregrounds(line).slice(start, start + command.length);
+		const green = gentleTheme.getFgAnsi("mdCode");
+		assert.deepEqual(colors, spans.flatMap((span, index) => [...span].map(() => index % 2 === 0 ? green : "")), "test, glab and both git executables use the Gentle green; arguments and operators stay neutral");
+	} finally { h.view.dispose(); }
+});
+
+test("Gentle command color resumes on wrapped executable cells and resets before padding and arguments", () => {
+	const executable = `./${"long-tool-".repeat(5)}run`;
+	const h = harness([job({ id: "branch", command: `${executable} --flag` })], 14, gentleTheme);
+	try {
+		const frame = h.frame(60);
+		const start = frame.findIndex((row) => stripAnsi(row).includes("Command "));
+		const end = frame.findIndex((row) => stripAnsi(row).includes("Status "));
+		assert.ok(start >= 0 && end > start + 1);
+		const column = stripAnsi(frame[start]!).indexOf("Command ") + "Command ".length;
+		const green = gentleTheme.getFgAnsi("mdCode");
+		let colored = "";
+		let rest = "";
+		for (const line of frame.slice(start, end)) {
+			assert.equal(visibleWidth(line), 60);
+			const text = stripAnsi(line);
+			const colors = foregrounds(line);
+			assert.equal(colors[column - 1], "", "the continuation indent does not inherit green");
+			assert.equal(colors.at(-1), gentleTheme.getFgAnsi("border"), "the frame keeps its border color");
+			for (let index = column; index < text.length - 1; index++) {
+				if (colors[index] === green) colored += text[index];
+				else {
+					assert.equal(colors[index], "", "arguments and padding stay neutral");
+					rest += text[index];
+				}
+			}
+		}
+		assert.equal(colored, executable);
+		assert.equal(rest.trim(), "--flag");
+	} finally { h.view.dispose(); }
+});
+
+test("command coloring preserves safe cleaning, wide argument wrapping, paging and plain logs", () => {
+	const command = `pr\x1b[31mintf\x1b[0m\t'${"wide界-token".repeat(8)}'\n --flag\x1b]0;unsafe\x07`;
+	const tail = Array.from({ length: 12 }, (_, index) => `\x1b[31moutput line ${index}\x1b[0m`);
+	const jobs = [job({ id: "build", command, tail })];
+	const green = gentleTheme.getFgAnsi("mdCode");
+	const plain = harness(jobs, 8);
+	const colored = harness(jobs, 8, { fg: (role, text) => role === "mdCode" ? gentleTheme.fg(role, text) : text });
+	try {
+		const first = colored.frame();
+		assert.deepEqual(first.map(stripAnsi), plain.screen());
+		assert.ok(first.some((line) => line.includes(`Command ${green}printf\x1b[39m '`)));
+		const continuation = first.find((line) => !line.includes("Command") && line.includes("wide"));
+		assert.ok(continuation && !continuation.includes(green), "wrapped arguments stay neutral");
+		assert.doesNotMatch(first.join("\n"), /unsafe|\x1b\[31m/);
+		for (const line of first) assert.equal(visibleWidth(line), 100);
+		for (const h of [plain, colored]) h.view.handleInput("\n");
+		const paged = colored.frame();
+		assert.deepEqual(paged, plain.frame(), "paging onto the output does not syntax-highlight it or restore its raw ANSI");
+		assert.ok(paged.some((line) => line.includes("output line")));
+		for (const h of [plain, colored]) h.view.handleInput("\x0b");
+		assert.deepEqual(colored.frame(), first);
+	} finally { plain.view.dispose(); colored.view.dispose(); }
+});
+
+test("command colors are reused across running refreshes and resizes, then refreshed for new commands and themes", () => {
+	const running = job({ id: "build", command: "printf 'first'" });
+	let color = "\x1b[31m";
+	const calls: string[] = [];
+	const jobs = [running];
+	const h = harness(jobs, 14, { fg: (role, text) => {
+		if (role !== "mdCode") return text;
+		calls.push(text);
+		return `${color}${text}\x1b[39m`;
+	} });
+	try {
+		assert.ok(h.frame().some((line) => line.includes(`${color}printf\x1b[39m 'first'`)));
+		running.tail.push("new output");
+		assert.ok(h.frame().some((line) => line.includes("new output")));
+		assert.ok(h.frame(80).some((line) => line.includes(`${color}printf\x1b[39m 'first'`)));
+		assert.deepEqual(calls, ["printf"]);
+		const next = job({ id: "publish", command: "echo 'second'" });
+		jobs.push(next);
+		h.view.handleInput("j");
+		assert.ok(h.frame().some((line) => line.includes(`${color}echo\x1b[39m 'second'`)));
+		color = "\x1b[35m";
+		h.view.invalidate();
+		const themed = h.frame().join("\n");
+		assert.ok(themed.includes(`${color}echo\x1b[39m 'second'`));
+		assert.ok(!themed.includes("\x1b[31m"));
+		assert.deepEqual(calls, ["printf", "echo", "echo"]);
+	} finally { h.view.dispose(); }
+});
+
 test("Ctrl+J pages the details down and Ctrl+K pages them up when they do not fit", () => {
 	const tail = Array.from({ length: 20 }, (_, index) => `output line ${index}`);
 	const h = harness([job({ id: "build", command: longCommand, tail })], 12);
